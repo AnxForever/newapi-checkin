@@ -56,6 +56,57 @@ from server.config import (  # noqa: E402
 	KEYS_CACHE_MAX_AGE,
 	AGENTROUTER_SESSION_TTL,
 )
+
+# ===== 防护/打码/通知（已迁至 server/protection.py、server/turnstile.py、server/notify.py）=====
+# 过渡期约定：域模块函数体内晚绑定 bs.<名字>；这里重导出保持 bs.<名字> 兼容。
+from server.protection import (  # noqa: E402
+	_WAF_CHALLENGE_RE,
+	_ESA_DENY_RE,
+	_WAF_POS,
+	_WAF_MASK,
+	_solve_acw_sc_v2,
+	_CF_CHALLENGE_BODY_RE,
+	_ALIYUN_WAF_COOKIE_NAMES,
+	protection_cache,
+	_protection_locks,
+	get_flaresolverr_url,
+	detect_protection,
+	solve_aliyun_waf,
+	solve_cf_challenge,
+	ensure_protection_cookies,
+	probe_page_protection,
+	protection_test,
+	protection_router,
+)
+from server.turnstile import (  # noqa: E402
+	TURNSTILE_SOLVER_PRESETS,
+	_TURNSTILE_SOLVER_SEM,
+	TURNSTILE_SOLVER_POLL_INTERVAL,
+	TURNSTILE_SOLVER_TIMEOUT,
+	get_turnstile_solver_config,
+	solve_turnstile_token,
+	_solve_turnstile_token_raw,
+	_solver_stats,
+	_solver_stats_bump,
+	TurnstileSolverRequest,
+	solver_stats,
+	solver_balance,
+	turnstile_solver_status,
+	save_turnstile_solver,
+	test_turnstile_solver,
+	turnstile_router,
+)
+from server.notify import (  # noqa: E402
+	get_notify_config,
+	notify_configured,
+	send_webhook_notify,
+	_mask_secret,
+	get_notify,
+	save_notify,
+	test_notify,
+	NotifyRequest,
+	notify_router,
+)
 from server.common import (  # noqa: E402
 	_atomic_write_json,
 	_read_json_cached,
@@ -77,6 +128,9 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title='New API Balance Manager', lifespan=_lifespan)
+app.include_router(protection_router)
+app.include_router(turnstile_router)
+app.include_router(notify_router)
 
 # 认证配置：从环境变量或 .env 读取（.env 已被 gitignore，别提交真实密码）。
 # 未设置 AUTH_PASSWORD 时自动生成随机密码写回 .env —— 开箱即用且每次部署都不同。
@@ -166,10 +220,6 @@ def checkin_gap_seconds() -> int:
 
 # WAF cookies 缓存: {provider: {'cookies': dict, 'expires': float}}
 waf_cache: dict = {}
-
-# 阿里云挑战页会把待求解的参数写成 var arg1='...'；ESA 拦截页会写明命中的规则名
-_WAF_CHALLENGE_RE = re.compile(r"arg1='([0-9A-Fa-f]+)'")
-_ESA_DENY_RE = re.compile(r'Denied by (\w+)')
 
 ANYROUTER_CONFIG = {
 	'domain': 'https://anyrouter.top',
@@ -561,27 +611,6 @@ async def waf_warmup():
 	if cookies:
 		return {'success': True, 'message': 'WAF cookies 已就绪'}
 	return {'success': False, 'message': 'WAF cookies 获取失败'}
-
-
-# 阿里云 WAF acw_sc__v2 挑战求解常量（从挑战页混淆脚本反混淆得到，长期稳定）
-_WAF_POS = [
-	0xF, 0x23, 0x1D, 0x18, 0x21, 0x10, 0x1, 0x26, 0xA, 0x9, 0x13, 0x1F, 0x28, 0x1B, 0x16, 0x17, 0x19, 0xD,
-	0x6, 0xB, 0x27, 0x12, 0x14, 0x8, 0xE, 0x15, 0x20, 0x1A, 0x2, 0x1E, 0x7, 0x4, 0x11, 0x5, 0x3, 0x1C, 0x22,
-	0x25, 0xC, 0x24,
-]
-_WAF_MASK = '3000176000856006061501533003690027800375'
-
-
-def _solve_acw_sc_v2(arg1: str) -> str:
-	"""根据挑战页的 arg1 计算阿里云 WAF 的 acw_sc__v2 cookie。
-
-	等价于挑战页混淆脚本：先按 q[i]=arg1[pos[i]-1] 重排，再与 mask 逐字节十六进制异或。
-	"""
-	q = ''.join(arg1[_WAF_POS[i] - 1] for i in range(len(_WAF_POS)))
-	v = ''
-	for i in range(0, min(len(q), len(_WAF_MASK)), 2):
-		v += format(int(q[i : i + 2], 16) ^ int(_WAF_MASK[i : i + 2], 16), '02x')
-	return v
 
 
 _waf_lock = asyncio.Lock()
@@ -1219,483 +1248,6 @@ async def newapi_turnstile_status(site: NewapiSite) -> dict:
 
 	waf_cache[cache_key] = {'value': value, 'expires': time.time() + WAF_CACHE_TTL}
 	return value
-
-
-# ========== Turnstile 打码平台（服务器端过 CF 人机校验）==========
-# 站点开着 Turnstile 时，签到 POST 必须带一次性 token。浏览器场景由前端生成的 Console
-# 脚本现场渲染 widget 取 token；服务器侧则接打码平台代解。三家主流平台（2Captcha /
-# YesCaptcha / CapSolver）都兼容 createTask + getTaskResult 协议，差异只有域名和 task.type。
-TURNSTILE_SOLVER_PRESETS = {
-	'2captcha': {'base_url': 'https://api.2captcha.com', 'task_type': 'TurnstileTaskProxyless'},
-	'yescaptcha': {'base_url': 'https://api.yescaptcha.com', 'task_type': 'TurnstileTaskProxyless'},
-	'capsolver': {'base_url': 'https://api.capsolver.com', 'task_type': 'AntiTurnstileTaskProxyLess'},
-}
-# 打码按次计费且平台侧有限速，求解并发固定 3，不跟站点签到并发（10）走
-_TURNSTILE_SOLVER_SEM = asyncio.Semaphore(3)
-TURNSTILE_SOLVER_POLL_INTERVAL = 3  # 秒
-TURNSTILE_SOLVER_TIMEOUT = 150  # 单个 token 求解上限
-
-
-def get_turnstile_solver_config() -> dict:
-	"""读打码平台配置（saved_config.json 的 turnstile_solver 段），缺省即未配置。"""
-	try:
-		cfg = _read_json_cached(CONFIG_FILE)
-	except Exception:
-		cfg = {}
-	s = cfg.get('turnstile_solver') if isinstance(cfg, dict) else None
-	s = s if isinstance(s, dict) else {}
-	provider = (s.get('provider') or '').strip().lower()
-	api_key = (s.get('api_key') or '').strip()
-	base_url = (s.get('base_url') or '').strip().rstrip('/')
-	preset = TURNSTILE_SOLVER_PRESETS.get(provider)
-	return {
-		'provider': provider,
-		'api_key': api_key,
-		'base_url': base_url or (preset['base_url'] if preset else ''),
-		# 自定义网关没指 task.type 时按 2Captcha 协议猜——绝大多数兼容网关都认这个名字
-		'task_type': preset['task_type'] if preset else ('TurnstileTaskProxyless' if base_url else ''),
-	}
-
-
-async def solve_turnstile_token(site_key: str, page_url: str, timeout: int = TURNSTILE_SOLVER_TIMEOUT) -> dict:
-	"""调打码平台解一个 Turnstile token，成功返回 {'success': True, 'token': ...}。
-
-	对外入口：先做不触网的预检（未配置/缺 sitekey 不计费用统计），再交给 _raw 实际
-	求解并按结果更新当日用量计数（solved / failed，落盘跨重启）。
-	"""
-	cfg = get_turnstile_solver_config()
-	if not (cfg['api_key'] and cfg['base_url'] and cfg['task_type']):
-		return {'success': False, 'error': '打码平台未配置（设置页选择平台并填 api_key）'}
-	if not site_key:
-		return {'success': False, 'error': '缺少 sitekey（站点状态探测失败）'}
-	r = await _solve_turnstile_token_raw(cfg, site_key, page_url, timeout)
-	_solver_stats_bump(bool(r.get('success')))
-	return r
-
-
-async def _solve_turnstile_token_raw(cfg: dict, site_key: str, page_url: str, timeout: int) -> dict:
-	"""实际调打码平台。同一 token 只能用一次（new-api 转发给 CF siteverify 后即作废），
-	每个账号签到前各解一个。CapSolver 的 createTask 可能直接带 solution.token，
-	与轮询 getTaskResult 两种返回方式一并兼容。
-	"""
-	def _post(path: str, payload: dict):
-		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
-		return sess.post(cfg['base_url'] + path, json=payload, timeout=30)
-
-	loop = asyncio.get_running_loop()
-
-	async with _TURNSTILE_SOLVER_SEM:
-		try:
-			resp = await loop.run_in_executor(_UPSTREAM_POOL, _post, '/createTask', {
-				'clientKey': cfg['api_key'],
-				'task': {'type': cfg['task_type'], 'websiteURL': page_url, 'websiteKey': site_key},
-			})
-			data = resp.json()
-			if data.get('errorId'):
-				return {'success': False, 'error': f"createTask 失败: {data.get('errorCode') or data.get('errorDescription')}"}
-			token = (data.get('solution') or {}).get('token')
-			if token:
-				return {'success': True, 'token': token}
-			task_id = data.get('taskId')
-			if not task_id:
-				return {'success': False, 'error': f'createTask 响应异常: {str(data)[:150]}'}
-
-			deadline = time.monotonic() + timeout
-			while time.monotonic() < deadline:
-				await asyncio.sleep(TURNSTILE_SOLVER_POLL_INTERVAL)
-				resp = await loop.run_in_executor(_UPSTREAM_POOL, _post, '/getTaskResult', {
-					'clientKey': cfg['api_key'], 'taskId': task_id,
-				})
-				data = resp.json()
-				if data.get('errorId'):
-					return {'success': False, 'error': f"求解失败: {data.get('errorCode') or data.get('errorDescription')}"}
-				if data.get('status') == 'ready':
-					token = (data.get('solution') or {}).get('token')
-					if token:
-						return {'success': True, 'token': token}
-					return {'success': False, 'error': '平台返回 ready 但没有 token'}
-			return {'success': False, 'error': f'求解超时（{timeout}s 未就绪）'}
-		except Exception as e:
-			return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-
-
-# ========== 通用站点防护层（CF 边缘质询 / 阿里云 WAF）==========
-# new-api 站点常见的网络层防护有两类：Cloudflare 边缘质询（cf-mitigated: challenge，
-# 403/503 +「Just a moment」页）和阿里云 WAF 的 acw_sc__v2 挑战（正文 var arg1='...'）。
-# 后者是纯算法可直接解；前者无浏览器解不了，借自托管开源项目 FlareSolverr 代过——
-# cf_clearance 与出口 IP、User-Agent 双重绑定，FlareSolverr 必须与本服务同出口。
-# newapi_request 撞到防护时自动取 cookies 原地重打一次：挑战页由防护层返回，请求没到过
-# new-api 源站，重试对签到是安全的（不会重复签）。
-
-_CF_CHALLENGE_BODY_RE = re.compile(r'Just a moment|challenge-platform|_cf_chl|cf-chl|Checking your browser', re.I)
-_ALIYUN_WAF_COOKIE_NAMES = ('acw_tc', 'cdn_sec_tc', 'acw_sc__v2')
-
-# 防护 cookies 缓存：{domain: {'cookies': dict, 'user_agent': str|None, 'expires': float}}，TTL 沿用 WAF_CACHE_TTL
-protection_cache: dict = {}
-_protection_locks: dict[str, asyncio.Lock] = {}
-
-
-def get_flaresolverr_url() -> str:
-	"""FlareSolverr 地址（saved_config.json 的 turnstile_solver.flaresolverr_url），未配置返回空串。"""
-	try:
-		cfg = _read_json_cached(CONFIG_FILE)
-	except Exception:
-		cfg = {}
-	s = cfg.get('turnstile_solver') if isinstance(cfg, dict) else None
-	return ((s or {}).get('flaresolverr_url') or '').strip().rstrip('/')
-
-
-def detect_protection(resp) -> str | None:
-	"""识别响应背后的防护层：'cf_challenge' / 'aliyun_waf'；正常返回 None。
-
-	CF 以官方 cf-mitigated 响应头为准，正文特征兜底（质询页变体多，头最可靠）；
-	阿里云 WAF 挑战页在 200 里也可能出现（校验中转页），认 arg1 特征。
-	"""
-	try:
-		headers = resp.headers or {}
-		body = resp.text or ''
-	except Exception:
-		return None
-	if str(headers.get('cf-mitigated', '')).lower() == 'challenge':
-		return 'cf_challenge'
-	if resp.status_code in (403, 503) and _CF_CHALLENGE_BODY_RE.search(body):
-		return 'cf_challenge'
-	if _WAF_CHALLENGE_RE.search(body):
-		return 'aliyun_waf'
-	return None
-
-
-async def solve_aliyun_waf(domain: str) -> dict | None:
-	"""过任意域名的阿里云 WAF 挑战：GET 首页 → 提 arg1 → 算 acw_sc__v2。失败返回 None。
-
-	独立 Session 收挑战页下发的 acw_tc/cdn_sec_tc（acw_sc__v2 与它们配对校验），
-	直连不走代理——这类站点平时不需要代理。
-	"""
-	def _do():
-		from curl_cffi import requests as cffi_requests
-
-		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
-		resp = sess.get(domain + '/', headers={'User-Agent': USER_AGENT})
-		m = _WAF_CHALLENGE_RE.search(resp.text or '')
-		if not m:
-			return None
-		cookies = {}
-		for name in _ALIYUN_WAF_COOKIE_NAMES:
-			val = sess.cookies.get(name)
-			if val:
-				cookies[name] = val
-		cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
-		return {'cookies': cookies, 'user_agent': None}
-
-	loop = asyncio.get_running_loop()
-	try:
-		return await loop.run_in_executor(_UPSTREAM_POOL, _do)
-	except Exception as e:
-		print(f'[PROTECT] {domain} 阿里云 WAF 求解失败: {e}')
-		return None
-
-
-async def solve_cf_challenge(domain: str) -> dict | None:
-	"""用 FlareSolverr 过 Cloudflare 边缘质询，返回 {cookies, user_agent}。
-
-	未配置 FlareSolverr 时直接返回 None——保持旧行为：撞质询就让调用方拿到 403/503。
-	"""
-	base = get_flaresolverr_url()
-	if not base:
-		return None
-
-	def _do():
-		sess = _get_cffi_session(f'flaresolverr:{base}')
-		return sess.post(base + '/v1', json={'cmd': 'request.get', 'url': domain + '/', 'maxTimeout': 60000}, timeout=70)
-
-	loop = asyncio.get_running_loop()
-	try:
-		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-		data = resp.json()
-		if data.get('status') != 'ok':
-			print(f'[PROTECT] {domain} FlareSolverr 求解失败: {str(data.get("message"))[:120]}')
-			return None
-		solution = data.get('solution') or {}
-		cookies = {c.get('name'): c.get('value') for c in solution.get('cookies', []) if c.get('name')}
-		if not cookies:
-			return None
-		return {'cookies': cookies, 'user_agent': solution.get('userAgent') or None}
-	except Exception as e:
-		print(f'[PROTECT] {domain} FlareSolverr 调用失败: {e}')
-		return None
-
-
-async def ensure_protection_cookies(site: NewapiSite, kind: str) -> dict | None:
-	"""确保某站点的防护 cookies 就绪（成功缓存 5 分钟，失败负缓存 60 秒），失败返回 None。
-
-	singleflight 很重要：签到是 10 并发，缓存过期瞬间不能让每个账号各打一次
-	FlareSolverr/WAF 挑战页（前者按次耗时几十秒，后者可能撞 IP 限流）。
-	失败也记一段短负缓存：FlareSolverr 挂掉时一批 10 个账号不至各自等满 70 秒超时，
-	60 秒后自动允许重试，不影响「服务恢复即恢复签到」。
-	"""
-	domain = site.domain.rstrip('/')
-	cached = protection_cache.get(domain)
-	if cached and cached.get('failed'):
-		# 负缓存：近期刚失败过，别再去撞求解器
-		if cached['expires'] > time.time():
-			return None
-		protection_cache.pop(domain, None)
-		cached = None
-	if cached and cached['expires'] > time.time():
-		return cached
-	lock = _protection_locks.setdefault(domain, asyncio.Lock())
-	async with lock:
-		cached = protection_cache.get(domain)
-		if cached and cached.get('failed') and cached['expires'] > time.time():
-			return None
-		if cached and not cached.get('failed') and cached['expires'] > time.time():
-			return cached
-		if kind == 'aliyun_waf':
-			solved = await solve_aliyun_waf(domain)
-		elif kind == 'cf_challenge':
-			solved = await solve_cf_challenge(domain)
-		else:
-			solved = None
-		if not solved:
-			protection_cache[domain] = {'failed': True, 'expires': time.time() + 60}
-			return None
-		entry = {**solved, 'expires': time.time() + WAF_CACHE_TTL}
-		protection_cache[domain] = entry
-		return entry
-
-
-async def probe_page_protection(domain: str) -> dict:
-	"""裸探测站点首页的防护层（不走 newapi_request 的自动过验），供添加站点时分类展示。"""
-	def _do():
-		from curl_cffi import requests as cffi_requests
-
-		sess = cffi_requests.Session(impersonate='chrome131', timeout=30)
-		return sess.get(domain + '/', headers={'User-Agent': USER_AGENT})
-
-	loop = asyncio.get_running_loop()
-	try:
-		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-		kind = detect_protection(resp)
-		return {
-			'http_status': resp.status_code,
-			'cf_challenge': kind == 'cf_challenge',
-			'aliyun_waf': kind == 'aliyun_waf',
-		}
-	except Exception as e:
-		return {'http_status': None, 'cf_challenge': False, 'aliyun_waf': False, 'error': str(e)[:100]}
-
-
-# ========== Webhook 通知（Telegram / Server酱 / Bark / 通用）==========
-# 邮件之外的第二条告警通道。配置存 saved_config.json 的 notify 段（该文件已在
-# gitignore 里且仅服务端持有，webhook URL 里的 bot token 与账号 token 同级敏感）。
-# 三家的差异只在请求形状，这里抹平成统一的 (title, body) 入口。
-
-def get_notify_config() -> dict:
-	"""读通知配置；未配置时返回 on_alert=True / on_checkin_failed=False 的默认值。"""
-	try:
-		cfg = _read_json_cached(CONFIG_FILE)
-	except Exception:
-		cfg = {}
-	n = cfg.get('notify') if isinstance(cfg, dict) else None
-	n = n if isinstance(n, dict) else {}
-	return {
-		'type': (n.get('type') or '').strip().lower(),
-		'url': (n.get('url') or '').strip(),
-		'chat_id': (n.get('chat_id') or '').strip(),
-		'on_alert': bool(n.get('on_alert', True)),
-		'on_checkin_failed': bool(n.get('on_checkin_failed', False)),
-	}
-
-
-def notify_configured() -> bool:
-	n = get_notify_config()
-	return bool(n['url']) and n['type'] in ('telegram', 'serverchan', 'bark', 'generic')
-
-
-async def send_webhook_notify(title: str, body: str) -> dict:
-	"""按配置发一条通知，返回 {sent: bool, error?}。未配置/发送失败都不抛异常。
-
-	Telegram 用 sendMessage（URL 含 bot token，chat_id 单独存）；Server酱是
-	KEY.send 表单；Bark 是 <key>/push 的 JSON；通用网关 POST {title, message}。
-	"""
-	n = get_notify_config()
-	if not notify_configured():
-		return {'sent': False, 'error': '通知未配置'}
-
-	# 各渠道请求形状不同：Telegram/通用收 JSON，Server酱只认表单编码，
-	# Bark 官方形式是 POST {origin}/push 且 device_key 放 body
-	form_data = None
-	if n['type'] == 'telegram':
-		url = n['url']
-		payload = {'chat_id': n['chat_id'], 'text': f'{title}\n\n{body}'}
-	elif n['type'] == 'serverchan':
-		url = n['url'] if n['url'].endswith('.send') else n['url'].rstrip('/') + '.send'
-		payload = {'title': title, 'desp': body}
-		form_data = payload
-	elif n['type'] == 'bark':
-		parsed = urlparse(n['url'])
-		device_key = parsed.path.rstrip('/').rpartition('/')[2]
-		if not device_key:
-			return {'sent': False, 'error': 'Bark URL 里没有 device key（应为 https://api.day.app/<key>）'}
-		url = f'{parsed.scheme}://{parsed.netloc}/push'
-		payload = {'device_key': device_key, 'title': title, 'body': body, 'group': 'newapi-checkin'}
-	else:
-		url = n['url']
-		payload = {'title': title, 'message': body}
-
-	def _do():
-		sess = _get_cffi_session('notify')
-		if form_data is not None:
-			return sess.post(url, data=form_data, timeout=15)
-		return sess.post(url, json=payload, timeout=15)
-
-	loop = asyncio.get_running_loop()
-	try:
-		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-		if resp.status_code != 200:
-			return {'sent': False, 'error': f'HTTP {resp.status_code}'}
-		return {'sent': True}
-	except Exception as e:
-		return {'sent': False, 'error': f'{type(e).__name__}: {e}'[:120]}
-
-
-def _mask_secret(value: str) -> str:
-	"""URL 里通常嵌着 bot token / sendkey，API 回显只露首尾（短 key 最多露 8 字符）。"""
-	if len(value) <= 40:
-		return value[:8] + '…' if value else ''
-	return value[:28] + '…' + value[-8:]
-
-
-# ── 打码用量统计：按天计数（次数 = 费用），跨重启持久化到 solver_stats.json ──
-SOLVER_STATS_FILE = Path(__file__).parent / 'solver_stats.json'
-
-
-def _solver_stats() -> dict:
-	today = datetime.now().strftime('%Y-%m-%d')
-	try:
-		data = json.loads(SOLVER_STATS_FILE.read_text(encoding='utf-8'))
-	except Exception:
-		data = {}
-	if not isinstance(data, dict) or data.get('date') != today:
-		data = {'date': today, 'solved': 0, 'failed': 0}
-	return data
-
-
-def _solver_stats_bump(ok: bool) -> None:
-	try:
-		data = _solver_stats()
-		data['solved' if ok else 'failed'] = data.get('solved' if ok else 'failed', 0) + 1
-		_atomic_write_json(SOLVER_STATS_FILE, data)
-	except Exception as e:
-		print(f'[SOLVER] 用量统计写入失败: {e}')
-
-
-@app.get('/api/turnstile/solver/stats')
-async def solver_stats():
-	"""今日打码用量（成功/失败次数，失败也消耗平台侧部分配额）"""
-	return {'success': True, 'stats': _solver_stats()}
-
-
-@app.post('/api/turnstile/solver/balance')
-async def solver_balance():
-	"""查询打码平台账户余额（按次查询，前端按钮触发，不自动轮询）。
-
-	2Captcha 用 res.php?action=getbalance，YesCaptcha/CapSolver/自定义网关走
-	createTask 同族的 POST /getBalance {clientKey}。
-	"""
-	cfg = get_turnstile_solver_config()
-	if not cfg['api_key']:
-		return {'success': False, 'error': '打码平台未配置'}
-
-	def _do_2captcha():
-		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
-		return sess.get(f'{cfg["base_url"]}/res.php', params={'key': cfg['api_key'], 'action': 'getbalance', 'json': 1}, timeout=15)
-
-	def _do_getbalance():
-		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
-		return sess.post(cfg['base_url'] + '/getBalance', json={'clientKey': cfg['api_key']}, timeout=15)
-
-	loop = asyncio.get_running_loop()
-	try:
-		if cfg['provider'] == '2captcha':
-			data = (await loop.run_in_executor(_UPSTREAM_POOL, _do_2captcha)).json()
-			# {"status":1,"request":"9.12"} 或 {"status":0,"request":"ERROR_..."}
-			if str(data.get('status')) == '1':
-				return {'success': True, 'balance': float(data.get('request', 0))}
-			return {'success': False, 'error': str(data.get('request'))[:100]}
-		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do_getbalance)
-		data = resp.json()
-		if data.get('errorId'):
-			return {'success': False, 'error': str(data.get('errorCode') or data.get('errorDescription'))[:100]}
-		if data.get('balance') is not None:
-			return {'success': True, 'balance': float(data['balance'])}
-		return {'success': False, 'error': f'响应异常: {str(data)[:100]}'}
-	except Exception as e:
-		return {'success': False, 'error': f'{type(e).__name__}: {e}'[:120]}
-
-
-@app.get('/api/notify')
-async def get_notify():
-	"""通知配置状态，URL 打码回显"""
-	n = get_notify_config()
-	return {
-		'success': True,
-		'notify': {
-			'type': n['type'],
-			'chat_id': n['chat_id'],
-			'url_masked': _mask_secret(n['url']) if n['url'] else '',
-			'configured': notify_configured(),
-			'on_alert': n['on_alert'],
-			'on_checkin_failed': n['on_checkin_failed'],
-		},
-	}
-
-
-class NotifyRequest(BaseModel):
-	"""通知配置。url 留空表示保留已保存的值（URL 含 token，不回显也就无法重传）。"""
-
-	type: str
-	url: str = ''
-	chat_id: str = ''
-	on_alert: bool = True
-	on_checkin_failed: bool = False
-
-
-@app.post('/api/notify')
-async def save_notify(req: NotifyRequest):
-	"""保存通知配置（合并写 saved_config.json，不动其他段）"""
-	ntype = req.type.strip().lower()
-	if ntype not in ('telegram', 'serverchan', 'bark', 'generic'):
-		return {'success': False, 'error': f'未知通知类型: {req.type}（可选 telegram / serverchan / bark / generic）'}
-	try:
-		data = dict(_read_json_cached(CONFIG_FILE) or {}) if CONFIG_FILE.exists() else {}
-	except Exception:
-		data = {}
-	saved = data.get('notify') or {}
-	# 换渠道必须重填 URL：不同渠道的 URL 格式互不兼容（Telegram 带路径 token、
-	# Server酱是 KEY.send、Bark 是 device key），沿用旧 URL 只会得到必然失败的配置
-	if not req.url.strip() and saved.get('url') and (saved.get('type') or ntype) != ntype:
-		return {'success': False, 'error': f'从 {saved.get("type")} 切换到 {ntype} 需要重新填写新渠道的 URL'}
-	data['notify'] = {
-		'type': ntype,
-		'url': req.url.strip() or saved.get('url') or '',
-		'chat_id': req.chat_id.strip(),
-		'on_alert': req.on_alert,
-		'on_checkin_failed': req.on_checkin_failed,
-	}
-	_atomic_write_json(CONFIG_FILE, data, indent=2)
-	return {'success': True, 'message': '通知配置已保存'}
-
-
-@app.post('/api/notify/test')
-async def test_notify():
-	"""发一条测试通知验证配置"""
-	if not notify_configured():
-		return {'success': False, 'error': '请先保存完整配置（类型 + URL）'}
-	r = await send_webhook_notify('✅ 测试通知', 'newapi-checkin 通知通道配置成功，这是一条测试消息。')
-	if r['sent']:
-		return {'success': True, 'message': '测试通知已发送'}
-	return {'success': False, 'error': r.get('error', '发送失败')}
 
 
 async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile_token: str | None = None) -> dict:
@@ -3825,140 +3377,6 @@ async def site_turnstile(site_id: str):
 	if err:
 		return err
 	return {'success': True, 'turnstile': await newapi_turnstile_status(site)}
-
-
-class TurnstileSolverRequest(BaseModel):
-	"""打码平台 / FlareSolverr 配置。api_key 留空表示保留已保存的值（前端不回显密钥）。"""
-
-	provider: str
-	api_key: str = ''
-	base_url: str = ''
-	flaresolverr_url: str = ''
-
-
-@app.get('/api/turnstile/solver')
-async def turnstile_solver_status():
-	"""打码平台 / FlareSolverr 配置状态。api_key 只回是否已配置，绝不回显。"""
-	cfg = get_turnstile_solver_config()
-	return {
-		'success': True,
-		'solver': {
-			'provider': cfg['provider'],
-			'base_url': cfg['base_url'],
-			'configured': bool(cfg['api_key'] and cfg['base_url'] and cfg['task_type']),
-			'flaresolverr_url': get_flaresolverr_url(),
-			'presets': {name: p['base_url'] for name, p in TURNSTILE_SOLVER_PRESETS.items()},
-			'stats': _solver_stats(),
-		},
-	}
-
-
-@app.post('/api/turnstile/solver')
-async def save_turnstile_solver(req: TurnstileSolverRequest):
-	"""保存打码平台 / FlareSolverr 配置（合并写 saved_config.json，不动其他段）"""
-	provider = req.provider.strip().lower()
-	if provider != 'custom' and provider not in TURNSTILE_SOLVER_PRESETS:
-		return {'success': False, 'error': f'未知平台: {req.provider}（可选 2captcha / yescaptcha / capsolver / custom）'}
-	try:
-		data = dict(_read_json_cached(CONFIG_FILE) or {}) if CONFIG_FILE.exists() else {}
-	except Exception:
-		data = {}
-	saved = data.get('turnstile_solver') or {}
-	data['turnstile_solver'] = {
-		'provider': provider,
-		'api_key': req.api_key.strip() or saved.get('api_key') or '',
-		'base_url': req.base_url.strip(),
-		'flaresolverr_url': req.flaresolverr_url.strip(),
-	}
-	_atomic_write_json(CONFIG_FILE, data, indent=2)
-	return {'success': True, 'message': '打码平台配置已保存'}
-
-
-@app.post('/api/protection/test')
-async def protection_test(site_id: str = ''):
-	"""探测某站点挂了哪些防护层，并现场验证突破手段是否可用。
-
-	首页裸探测只反映「当前这次响应」的防护（部分站点仅对 API 或按负载触发质询），
-	结果是最保守的分类；运行期 newapi_request 撞到防护都会自动过验重试。
-	solved 里 None 表示撞到了但没配求解器（CF 质询需 FlareSolverr）。
-	"""
-	sites = load_newapi_sites()
-	if site_id:
-		site = next((s for s in sites if s.id == site_id), None)
-		if site is None:
-			return {'success': False, 'error': f'未知站点: {site_id}'}
-	else:
-		if not sites:
-			return {'success': False, 'error': '没有站点可探测'}
-		site = sites[0]
-	domain = site.domain.rstrip('/')
-
-	page = await probe_page_protection(domain)
-	ts = await newapi_turnstile_status(site)
-	protections = {
-		'cf_challenge': bool(page.get('cf_challenge')),
-		'aliyun_waf': bool(page.get('aliyun_waf')),
-		'turnstile': bool(ts['enabled']),
-	}
-	solved: dict = {}
-	if protections['aliyun_waf']:
-		solved['aliyun_waf'] = bool(await solve_aliyun_waf(domain))
-	if protections['cf_challenge']:
-		if get_flaresolverr_url():
-			solved['cf_challenge'] = bool(await solve_cf_challenge(domain))
-		else:
-			solved['cf_challenge'] = None
-	return {
-		'success': True,
-		'site': site.label,
-		'domain': site.domain,
-		'page_http_status': page.get('http_status'),
-		'page_error': page.get('error'),
-		'protections': protections,
-		'solved': solved,
-		'flaresolverr_configured': bool(get_flaresolverr_url()),
-	}
-
-
-@app.post('/api/turnstile/solver/test')
-async def test_turnstile_solver(site_id: str = ''):
-	"""实解一个 token 验证打码配置（会消耗一次打码费用，约 $0.001~0.002）。
-
-	不指定站点时自动挑第一个开着 Turnstile 且有 sitekey 的站点。只求解不消费：
-	token 不会拿去签到，纯验证 api_key、余额与网络链路是否可用。
-	"""
-	cfg = get_turnstile_solver_config()
-	if not cfg['api_key']:
-		return {'success': False, 'error': '请先保存 api_key'}
-	sites = load_newapi_sites()
-	site = None
-	site_key = ''
-	if site_id:
-		site = next((s for s in sites if s.id == site_id), None)
-		if site is None:
-			return {'success': False, 'error': f'未知站点: {site_id}'}
-		ts = await newapi_turnstile_status(site)
-		if not ts['enabled']:
-			return {'success': True, 'tested': False, 'message': f'{site.label} 未开启 Turnstile，无需打码'}
-		if not ts['site_key']:
-			return {'success': False, 'error': f'{site.label} 状态探测失败拿不到 sitekey'}
-		site_key = ts['site_key']
-	else:
-		for s in sites:
-			ts = await newapi_turnstile_status(s)
-			if ts['enabled'] and ts['site_key']:
-				site, site_key = s, ts['site_key']
-				break
-		if site is None:
-			return {'success': False, 'error': '没有开着 Turnstile 的站点，没有可用于测试的 sitekey'}
-
-	page_url = site.domain.rstrip('/') + '/login'
-	started = time.monotonic()
-	r = await solve_turnstile_token(site_key, page_url)
-	elapsed = round(time.monotonic() - started, 1)
-	if r.get('success'):
-		return {'success': True, 'tested': True, 'site': site.label, 'elapsed': elapsed, 'token_preview': (r['token'] or '')[:24] + '…'}
-	return {'success': False, 'tested': True, 'site': site.label, 'elapsed': elapsed, 'error': r.get('error')}
 
 
 @app.get('/api/site/{site_id}/checkin/status')

@@ -59,8 +59,9 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
 - [x] 块3 余额监控域 → server/monitor.py(d1b5885)
 - [x] 块A core:config.py(env/常量/路径)+ common.py(jsonio/spawn/pool/session)。
       顺带修正:_PROXY 原先在 _load_dotenv 之前求值,.env 的 HTTPS_PROXY 不生效。
-- [ ] 块B 通知与防护:notify.py、protection.py、turnstile.py。依赖 config/common,
-      互相独立。审核点:webhook/求解的 bs 晚绑定在迁移后仍可从 bs 命名空间 patch。
+- [x] 块B 通知与防护:notify.py、protection.py、turnstile.py。审核确认:被测内部
+      调用（ensure 的求解、protection_test 的探测）必须走 bs. 才能被 patch 拦截——
+      发现并修复 2 处;9 端点鉴权一致;阿里云 WAF 算法随 protection 迁移。
 - [ ] 块C 站点域:sites.py(注册表 + newapi_request 自动过验 + 签到调度 + 打码预检 +
       站点巡检)。审核点:newapi_request 对 protection 的依赖方向(sites→protection,
       不得反向)。
