@@ -21,10 +21,6 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
-# anyrouter.top 与 agentrouter.org 现均需经本地代理（mihomo 7890）访问，且需浏览器级 TLS 指纹
-_LOCAL_PROXY = 'http://127.0.0.1:7890'
-_PROXY = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or _LOCAL_PROXY
-_AGENTROUTER_PROXY = _LOCAL_PROXY
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -32,24 +28,43 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-
-def _load_dotenv() -> None:
-	"""极简 .env 加载：KEY=VALUE 每行一条，# 开头是注释；已存在的环境变量优先于 .env。"""
-	env_file = Path(__file__).parent / '.env'
-	try:
-		for line in env_file.read_text(encoding='utf-8').splitlines():
-			line = line.strip()
-			if not line or line.startswith('#') or '=' not in line:
-				continue
-			key, _, value = line.partition('=')
-			key, value = key.strip(), value.strip().strip('\'"')
-			if key and key not in os.environ:
-				os.environ[key] = value
-	except OSError:
-		pass  # 没有 .env 就全靠环境变量
-
-
-_load_dotenv()
+# ===== 基础设施与配置（已迁至 server/config.py / server/common.py）=====
+# 常量与无状态工具的唯一住所迁移至 server 包；此处重导出保持 bs.<名字> 兼容
+# （测试 patch bs.X / 域模块过渡期读 bs.X 均继续有效）。config 导入即加载 .env。
+from server.config import (  # noqa: E402
+	_LOCAL_PROXY,
+	_PROXY,
+	_AGENTROUTER_PROXY,
+	USER_AGENT,
+	CONFIG_FILE,
+	NEW_ACCOUNTS_FILE,
+	USAGE_FILE,
+	AGENTROUTER_ACCOUNTS_FILE,
+	CHECKIN_STATE_FILE,
+	ANYROUTER_CHECKIN_STATE_FILE,
+	CHECKIN_SETTINGS_FILE,
+	NEWAPI_SITES_FILE,
+	KEYS_CACHE_FILE,
+	AGENTROUTER_SESSION_FILE,
+	CHECKIN_MIN_DELAY,
+	CHECKIN_MAX_DELAY,
+	WAF_CACHE_TTL,
+	ANYROUTER_CONCURRENCY,
+	NEWAPI_CONCURRENCY,
+	TOKEN_LIST_PATH,
+	TOKEN_PAGE_SIZE,
+	KEYS_CACHE_MAX_AGE,
+	AGENTROUTER_SESSION_TTL,
+)
+from server.common import (  # noqa: E402
+	_atomic_write_json,
+	_read_json_cached,
+	_read_json_models,
+	_background_tasks,
+	_spawn,
+	_UPSTREAM_POOL,
+	_get_cffi_session,
+)
 
 
 @contextlib.asynccontextmanager
@@ -140,84 +155,6 @@ async def auth_middleware(request: Request, call_next):
 	return await call_next(request)
 
 
-# ── 通用工具 ────────────────────────────────────────────────────────────────
-
-def _atomic_write_json(path: Path, data, indent: int | None = None) -> None:
-	"""原子写 JSON：先写临时文件再 os.replace。
-
-	直接 write_text 覆盖原文件，进程在写入中途崩溃/断电会留下半个 JSON；
-	os.replace 在同一文件系统上是原子的，最坏情况也只是旧文件完好无损。
-	"""
-	tmp = path.with_name(path.name + '.tmp')
-	tmp.write_text(json.dumps(data, ensure_ascii=False, indent=indent), encoding='utf-8')
-	os.replace(tmp, path)
-	# 本进程是这些配置文件唯一的写入方，写完直接丢缓存，下次读按新 mtime 重建
-	_json_cache.pop(path, None)
-
-
-# 配置文件读多写少（几乎每个 API 请求都要 load 一遍账号/站点清单），
-# 按 (mtime_ns, size) 缓存解析结果：文件没变就只做一次 stat，不再反复读盘 + json.loads。
-# 进程外手动改文件也会因 mtime 变化自动失效。
-_json_cache: dict[Path, tuple[tuple[int, int], object]] = {}
-
-
-def _read_json_cached(path: Path) -> object:
-	"""读 JSON 并走 mtime 缓存；文件不存在抛 FileNotFoundError，损坏抛 JSONDecodeError"""
-	try:
-		st = path.stat()
-	except OSError as e:
-		_json_cache.pop(path, None)
-		raise FileNotFoundError(str(path)) from e
-	stamp = (st.st_mtime_ns, st.st_size)
-	cached = _json_cache.get(path)
-	if cached is not None and cached[0] == stamp:
-		return cached[1]
-	data = json.loads(path.read_text(encoding='utf-8'))
-	_json_cache[path] = (stamp, data)
-	return data
-
-
-def _read_json_models(path: Path, model, tag: str) -> list:
-	"""读取「JSON 数组 + pydantic 模型」配置文件的公共样板；文件不存在或损坏都返回空列表"""
-	try:
-		data = _read_json_cached(path)
-		return [model(**item) for item in data]
-	except FileNotFoundError:
-		return []
-	except Exception as e:
-		print(f'[{tag}] 加载 {path.name} 失败: {e}')
-		return []
-
-
-# 后台任务强引用：事件循环对 task 只持弱引用，不保存随时可能被 GC 静默杀掉
-_background_tasks: set = set()
-
-
-def _spawn(coro):
-	"""create_task 并持有引用，结束后自动清理。所有长生命周期调度器都该走这里。"""
-	task = asyncio.create_task(coro)
-	_background_tasks.add(task)
-	task.add_done_callback(_background_tasks.discard)
-	return task
-
-
-# 配置文件路径
-CONFIG_FILE = Path(__file__).parent / 'saved_config.json'
-NEW_ACCOUNTS_FILE = Path(__file__).parent / 'new_accounts_config.json'
-USAGE_FILE = Path(__file__).parent / 'daily_usage.json'
-AGENTROUTER_ACCOUNTS_FILE = Path(__file__).parent / 'agentrouter_accounts.json'
-CHECKIN_STATE_FILE = Path(__file__).parent / 'checkin_state.json'
-ANYROUTER_CHECKIN_STATE_FILE = Path(__file__).parent / 'anyrouter_checkin_state.json'
-CHECKIN_SETTINGS_FILE = Path(__file__).parent / 'checkin_settings.json'
-# 通用 new-api 站点注册表。gorouter.app / tabitoken.com 这类同构站点都登记在这里，
-# 新增站点只需往这个文件里加一条（前端「站点管理」即可完成），后端无需改代码。
-NEWAPI_SITES_FILE = Path(__file__).parent / 'newapi_sites.json'
-
-# Login 账号签到节奏：每个账号之间随机等待 30~60 分钟，避免登录接口按 IP 限流（429）
-CHECKIN_MIN_DELAY = 1800  # 30 分钟（默认；实际间隔以 checkin_settings 的 agentrouter_gap_min/max 为准）
-CHECKIN_MAX_DELAY = 3600  # 60 分钟
-
-
 def checkin_gap_seconds() -> int:
 	"""缓慢签到模式的账号间隔（秒），范围可由前端设置（分钟）。设置坏了就退回默认 30~60 分钟"""
 	try:
@@ -229,7 +166,6 @@ def checkin_gap_seconds() -> int:
 
 # WAF cookies 缓存: {provider: {'cookies': dict, 'expires': float}}
 waf_cache: dict = {}
-WAF_CACHE_TTL = 300  # 5 分钟
 
 # 阿里云挑战页会把待求解的参数写成 var arg1='...'；ESA 拦截页会写明命中的规则名
 _WAF_CHALLENGE_RE = re.compile(r"arg1='([0-9A-Fa-f]+)'")
@@ -291,47 +227,6 @@ NEWAPI_SEED_SITES = [
 		'accent': 'sky',
 	},
 ]
-
-
-USER_AGENT = (
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
-)
-
-# 上游请求专用线程池。curl_cffi 是同步库，靠线程池并发；此前用的是 asyncio 默认线程池，
-# 容量固定为 min(32, cpu_count + 4)，本机 4 核 = 8 个 worker，成了真正的瓶颈：
-# 实测 162 个请求在 Semaphore=15/池=8 下 14.2s，池放到 20 后 7.5s，光加 Semaphore 无效。
-_UPSTREAM_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix='upstream')
-
-# 单站并发上限。总并发受线程池 32 约束；AnyRouter 的 token 与 cookie 两类账号会同时查询，
-# 因此 12 × 2 = 24 仍在池容量内。Login（agentrouter.org）不在此列——登录接口按 IP 限流。
-ANYROUTER_CONCURRENCY = 12
-# 通用 new-api 站点的默认并发，可被单个站点配置里的 concurrency 覆盖
-NEWAPI_CONCURRENCY = 10
-
-_thread_local = threading.local()
-
-
-def _get_cffi_session(key: str, proxies: dict | None = None):
-	"""取当前线程的 curl_cffi Session（按 key 区分不同站点/代理配置）。
-
-	复用 Session 才能复用代理 CONNECT 隧道与 TLS 握手，实测单请求中位耗时 0.56s → 0.19s。
-
-	注意：curl_cffi 的 Session 会把每次请求传入的 cookies 累积进自己的 jar，并在后续请求中
-	继续发送（已实测），而同一个 Session 会被不同账号轮流复用，所以每次取用时必须清空 cookie，
-	否则上一个账号的 session cookie 会串到下一个账号的请求上。
-	"""
-	from curl_cffi import requests as cffi_requests
-
-	pool = getattr(_thread_local, 'sessions', None)
-	if pool is None:
-		pool = {}
-		_thread_local.sessions = pool
-	sess = pool.get(key)
-	if sess is None:
-		sess = cffi_requests.Session(impersonate='chrome131', proxies=proxies, timeout=30)
-		pool[key] = sess
-	sess.cookies.clear()
-	return sess
 
 
 _exit_generation = 0
@@ -1076,7 +971,6 @@ async def sign_in_login(account: LoginAccountItem) -> dict:
 				await asyncio.sleep(1.5 * (attempt + 1))
 				continue
 			return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
-
 
 
 def load_login_accounts() -> list[LoginAccountItem]:
@@ -1863,7 +1757,6 @@ async def newapi_checkin_info(site: NewapiSite, account: NewapiAccountItem) -> d
 		}
 	except Exception as e:
 		return {'name': account.name, 'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-
 
 
 def add_checkin_log(msg: str):
