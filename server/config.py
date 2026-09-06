@@ -9,6 +9,7 @@ env 派生值依然正确。
 """
 
 import os
+import re
 from pathlib import Path
 
 # ── .env 加载 ────────────────────────────────────────────────────────────────
@@ -58,6 +59,13 @@ CHECKIN_SETTINGS_FILE = _BASE_DIR / 'checkin_settings.json'
 NEWAPI_SITES_FILE = _BASE_DIR / 'newapi_sites.json'
 KEYS_CACHE_FILE = _BASE_DIR / 'keys_cache.json'
 AGENTROUTER_SESSION_FILE = _BASE_DIR / 'agentrouter_sessions.json'
+
+# ── mihomo 出口轮换 ─────────────────────────────────────────────────────────
+
+MIHOMO_CONFIG_FILE = Path(os.environ.get('MIHOMO_CONFIG') or Path.home() / 'mihomo' / 'config.yaml')
+MIHOMO_GROUP = os.environ.get('MIHOMO_GROUP', '')  # mihomo 代理组名，出口轮换用；空 = 不轮换（行为安全降级）
+# 组里混着信息项（剩余流量/官网）和子分组（自动选择/故障转移），还有全部不可达的 V6 节点，都跳过
+MIHOMO_NODE_SKIP = re.compile(r'剩余流量|重置|到期|建议|官网|自动选择|故障转移|V6')
 
 # ── 速率与间隔 ───────────────────────────────────────────────────────────────
 

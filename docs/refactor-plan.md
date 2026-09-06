@@ -66,9 +66,12 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
       站点巡检)。审核确认:依赖方向 sites→protection 正确;NEWAPI_SEED_SITES/
       site_patrol_fails 被测试重绑故留 bs,站点端点暂留主文件（块E 收口）;
       NewapiSite 路径方法经 bs.__file__ 解析根目录（迁移后 __file__ 指向 server/）。
-- [ ] 块D 代理与登录:mihomo.py(switcher 底座与两个 Rotator)+ agentrouter.py
-      (登录 session、登录签到、登录余额;keys.py 的 `_agentrouter_session` 改为
-      从本域导入——去耦 keys 与 agentrouter)。审核点:session 文件读写的 patch 目标。
+- [x] 块D1 mihomo.py(switcher 底座、ExitRotator、_KeysExitRotator、探针、WAF pacing
+      常量)。审核确认:_exit_generation 被测试观察/重绑,家在 bs,域内经 bs. 读写;
+      MIHOMO_* env 常量归 config.py;WAF pacing 常量消费方仍在 bs 故留 bs(块D2 随迁)。
+- [ ] 块D2 agentrouter.py(登录 session、登录签到、登录余额;keys.py 的
+      `_agentrouter_session` 改为从本域导入)+ cookies.py(cookie 续期与余额)。
+      审核点:session 文件读写的 patch 目标;_run_with_rotation 随域迁移。
 - [ ] 块E 端点收尾 + 去晚绑定:cookie 域、token/site/login 端点路由、auth.py、
       webui.py;全部 bs.* 换真实导入;测试 patch 目标逐文件迁移。审核点:每改一个
       测试文件即跑该文件,最后全量。

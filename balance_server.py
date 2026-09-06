@@ -44,6 +44,9 @@ from server.config import (  # noqa: E402
 	ANYROUTER_CHECKIN_STATE_FILE,
 	CHECKIN_SETTINGS_FILE,
 	NEWAPI_SITES_FILE,
+	MIHOMO_CONFIG_FILE,
+	MIHOMO_GROUP,
+	MIHOMO_NODE_SKIP,
 	KEYS_CACHE_FILE,
 	AGENTROUTER_SESSION_FILE,
 	CHECKIN_MIN_DELAY,
@@ -270,20 +273,38 @@ NEWAPI_SEED_SITES = [
 ]
 
 
+
+
+
+# ========== mihomo 代理域（已迁至 server/mihomo.py） ==========
+# 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；_exit_generation/_ar_session_key
+# 因 global 原地递增的耦合关系整体随域迁移，不经 bs.（bs 无读取方）。
+from server.mihomo import (  # noqa: E402
+	_ar_session_key,
+	WAF_PASS_CACHE_TTL,
+	_waf_pass_cache,
+	_balances_query_lock,
+	_mihomo_controller,
+	_mihomo_call,
+	_query_egress_ip,
+	_probe_exit_passes_waf,
+	_MihomoGroupSwitcher,
+	ExitRotator,
+	_KeysExitRotator,
+)
+
+# 出口代数计数器：mihomo.ExitRotator 递增、_ar_session_key 读取；测试观察/重绑，家在 bs
 _exit_generation = 0
 
-
-def _ar_session_key(base: str) -> str:
-	"""agentrouter 专用连接池 key，带出口代数。
-
-	mihomo 切换节点**不会杀掉已建立的 keep-alive 隧道**，复用 Session 会继续从旧出口
-	出去（2026-08-22 实测：连切三个节点，复用连接的出口 IP 纹丝不动，新建连接才跟随切换）。
-	ExitRotator 每次切换出口把代数 +1 逼请求重新建连 —— 不带代数的话轮换形同虚设，
-	所有批次都从第一个出口 IP 出去，那个 IP 的 WAF 预算瞬间打满。
-	"""
-	return f'{base}:g{_exit_generation}'
-
-
+# WAF 轮换 pacing（消费方：_run_with_rotation / 登录余额流，暂留本模块，块D2 随域迁出）
+WAF_BATCH_SIZE = 4  # 单个出口 IP 每轮最多查几个（实测 ~8 个触发滑块，留余量给重试）
+WAF_ROUND_GAP = 4  # 换了新出口 IP 时，轮与轮之间的间隔秒数
+WAF_DEGRADED_GAP = 20  # 没有轮换可用（同 IP 硬扛）时的间隔秒数
+WAF_IP_BUDGET = 6  # 单个出口 IP 在整轮查询里的请求预算（实测 ~8 触发滑块）
+WAF_COOLDOWN = 45  # 所有出口 IP 都花光预算时的冷却秒数（等 WAF 计数窗口滑过）
+WAF_MAX_ATTEMPTS = 3  # 单个账号最多尝试次数（cookie 被滑块标记后要重登，反复被拦就放弃）
+WAF_DEADLINE = 420  # 整轮查询的时长上限（秒），超时把剩余账号报错返回
+WAF_ABORT_STREAK = 8  # 连续这么多个账号被拦且零成功就提前中止：再打只是给惩罚窗口续命
 class AccountItem(BaseModel):
 	"""传统 session cookie 方式"""
 	name: str
@@ -2007,231 +2028,6 @@ async def update_checkin_settings(req: dict):
 # （切到能过 WAF 的节点、结束后恢复原节点 —— 期间经 7890 的其它流量出口会跟着变），每轮每 IP 只查
 # WAF_BATCH_SIZE 个账号，被拦的下一轮换 IP 重登再试。
 
-MIHOMO_CONFIG_FILE = Path(os.environ.get('MIHOMO_CONFIG') or Path.home() / 'mihomo' / 'config.yaml')
-MIHOMO_GROUP = os.environ.get('MIHOMO_GROUP', '')  # mihomo 代理组名，出口轮换用；空 = 不轮换（行为安全降级）
-# 组里混着信息项（剩余流量/官网）和子分组（自动选择/故障转移），还有全部不可达的 V6 节点，都跳过
-MIHOMO_NODE_SKIP = re.compile(r'剩余流量|重置|到期|建议|官网|自动选择|故障转移|V6')
-WAF_BATCH_SIZE = 4  # 单个出口 IP 每轮最多查几个（实测 ~8 个触发滑块，留余量给重试）
-WAF_ROUND_GAP = 4  # 换了新出口 IP 时，轮与轮之间的间隔秒数
-WAF_DEGRADED_GAP = 20  # 没有轮换可用（同 IP 硬扛）时的间隔秒数
-WAF_IP_BUDGET = 6  # 单个出口 IP 在整轮查询里的请求预算（实测 ~8 触发滑块）
-WAF_COOLDOWN = 45  # 所有出口 IP 都花光预算时的冷却秒数（等 WAF 计数窗口滑过）
-WAF_MAX_ATTEMPTS = 3  # 单个账号最多尝试次数（cookie 被滑块标记后要重登，反复被拦就放弃）
-WAF_DEADLINE = 420  # 整轮查询的时长上限（秒），超时把剩余账号报错返回
-WAF_ABORT_STREAK = 8  # 连续这么多个账号被拦且零成功就提前中止：再打只是给惩罚窗口续命
-WAF_PASS_CACHE_TTL = 30 * 60  # 「哪些节点能过 WAF」的探测结果缓存（探测要 1~2 分钟，别每次点都来）
-_waf_pass_cache: dict = {'ts': 0.0, 'nodes': [], 'ips': []}
-_balances_query_lock = asyncio.Lock()  # 轮换出口是全局动作，同时只能跑一轮查询
-
-
-def _mihomo_controller() -> tuple[str, str] | None:
-	"""从 mihomo 配置读 (controller 地址, secret)；读不到返回 None（此时不轮换）。"""
-	try:
-		text = MIHOMO_CONFIG_FILE.read_text(encoding='utf-8')
-	except OSError:
-		return None
-	addr = secret = None
-	for line in text.splitlines():
-		if addr is None and line.startswith('external-controller:'):
-			addr = line.split(':', 1)[1].strip()
-		elif secret is None and line.startswith('secret:'):
-			secret = line.split(':', 1)[1].strip().strip('\'"')
-	if not addr:
-		return None
-	host, _, port = addr.rpartition(':')
-	host = host.strip('[]')
-	if host in ('0.0.0.0', '::', ''):
-		host = '127.0.0.1'
-	return f'http://{host}:{port}', secret or ''
-
-
-def _mihomo_call(method: str, url: str, secret: str, body: dict | None = None):
-	"""同步调 mihomo controller；异常返回 None（本地服务，失败就当不可用）。"""
-	from curl_cffi import requests as cffi_requests
-
-	try:
-		return cffi_requests.request(
-			method, url, headers={'Authorization': f'Bearer {secret}'}, json=body, timeout=8,
-		)
-	except Exception:
-		return None
-
-
-async def _query_egress_ip() -> str | None:
-	"""当前代理出口的公网 IP。切完节点必须核对它 —— 节点名不同 ≠ 出口 IP 不同
-	（实测原生 03/04 同 IP，专线 01/02 与 IPLC06 同 IP）。"""
-	from curl_cffi import requests as cffi_requests
-
-	proxies = {'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY}
-
-	def _do():
-		for url in ('https://api.ip.sb/ip', 'https://ifconfig.me/ip'):
-			try:
-				r = cffi_requests.get(url, proxies=proxies, timeout=6)
-				if r.status_code == 200 and r.text.strip():
-					return r.text.strip()
-			except Exception:
-				continue
-		return None
-
-	return await asyncio.get_running_loop().run_in_executor(_UPSTREAM_POOL, _do)
-
-
-async def _probe_exit_passes_waf() -> bool:
-	"""匿名探测当前出口能否过 agentrouter 的 WAF。
-
-	打 /api/user/self 但带一次性假 cookie —— 即使被滑块标记，标记的也是这个假 cookie，
-	不伤真账号的 session。拿到 JSON（401 也算）= 放行；滑块页/429/不可达 = 不放行。
-	实测（2026-08-22）：原生/家宽/专线 IP 基本都过，廉价数据中心（Vless 系）被拦，
-	与地区无关 —— 所以轮换池不挑地区，谁能过用谁。
-	"""
-	from curl_cffi import requests as cffi_requests
-
-	def _do():
-		try:
-			r = cffi_requests.get(
-				f'{AGENTROUTER_ORG_CONFIG["domain"]}{AGENTROUTER_ORG_CONFIG["user_info_path"]}',
-				headers={
-					'User-Agent': USER_AGENT,
-					'Accept': 'application/json, text/plain, */*',
-					'new-api-user': '1',
-					'Authorization': 'Bearer probe',
-					'cookie': 'session=probe',
-				},
-				proxies={'https': _AGENTROUTER_PROXY, 'http': _AGENTROUTER_PROXY},
-				impersonate='chrome131',
-				timeout=6,
-			)
-			return agentrouter_block_reason(r) is None
-		except Exception:
-			return False
-
-	return await asyncio.get_running_loop().run_in_executor(_UPSTREAM_POOL, _do)
-
-
-class _MihomoGroupSwitcher:
-	"""mihomo 代理组切换的公共底座：controller 定位、API 封装、原节点记忆与恢复。
-
-	ExitRotator（余额/全签的 WAF 出口轮换）与 _KeysExitRotator（取密钥撞限流换出口）
-	共用这套机制，差别只在「怎么挑下一个节点」的策略（子类实现）。
-	"""
-
-	def __init__(self):
-		self._base, self._secret = None, None
-		self._original = None
-		self._nodes: list[str] = []
-		self._idx = -1
-		self._touched = False
-
-	async def _api(self, method: str, path: str, body: dict | None = None):
-		resp = await asyncio.get_running_loop().run_in_executor(
-			_UPSTREAM_POOL, _mihomo_call, method, f'{self._base}{path}', self._secret, body,
-		)
-		if resp is None or resp.status_code >= 300:
-			return None
-		if method == 'GET':
-			try:
-				return resp.json()
-			except Exception:
-				return None
-		return {}
-
-	async def _select(self, node: str) -> bool:
-		ok = await self._api('PUT', f'/proxies/{quote(MIHOMO_GROUP)}', {'name': node})
-		if ok is not None:
-			self._touched = True
-		return ok is not None
-
-	async def restore(self) -> None:
-		if self._touched and self._original:
-			if await self._select(self._original):
-				global _exit_generation
-				_exit_generation += 1  # 恢复原节点后同样要重新建连
-			self._touched = False
-
-
-class ExitRotator(_MihomoGroupSwitcher):
-	"""查询期间轮换 mihomo 出口 IP，结束后恢复原节点。
-
-	候选是组里**全部真实节点**（不限地区）：按实际出口 IP 去重后逐个用匿名探针实测能否过
-	agentrouter 的 WAF，能过的都进轮换池（2026-08-22 实测约 10 个独立 IP：香港原生/新加坡/
-	日本专线/韩国家宽/美国原生与专线）。探测结果缓存 WAF_PASS_CACHE_TTL —— 探测要 1~2 分钟，
-	而且探测本身也在消耗各 IP 的 WAF 配额。
-
-	controller 读不到 / 凑不出能过的节点时 start() 返回 False，查询退化为「不换 IP 只分批」。
-	探测要切节点（期间影响用户经 7890 的其它流量），限时 150 秒。
-	"""
-
-	def __init__(self):
-		super().__init__()
-		self._ips: list[str] = []
-
-	@property
-	def ip_count(self) -> int:
-		return len(self._ips)
-
-	async def start(self) -> bool:
-		"""发现能过 WAF 的出口节点，记住原节点。优先用缓存。"""
-		ctl = _mihomo_controller()
-		if not ctl:
-			return False
-		self._base, self._secret = ctl
-		info = await self._api('GET', f'/proxies/{quote(MIHOMO_GROUP)}')
-		if not info or not info.get('all'):
-			return False
-		self._original = info.get('now')
-		if _waf_pass_cache['nodes'] and time.time() - _waf_pass_cache['ts'] < WAF_PASS_CACHE_TTL:
-			pairs = [(n, ip) for n, ip in zip(_waf_pass_cache['nodes'], _waf_pass_cache['ips']) if n in info['all'] and n != self._original]
-			if pairs:
-				# 缓存路径不再核对出口 IP（节点 IP 会漂移）；漂移导致撞上热 IP 由运行时的预算/热度记账兜底
-				self._nodes = [n for n, _ in pairs]
-				self._ips = [ip for _, ip in pairs]
-				self._idx = -1
-				return True
-		used = set()
-		if self._original:
-			used.add(self._original)
-		orig_ip = await _query_egress_ip()
-		if orig_ip:
-			used.add(orig_ip)  # 用户刚被拦过的 IP，别再拿它查询
-		t0 = time.time()
-		for name in info['all']:
-			if time.time() - t0 > 150:
-				break
-			if MIHOMO_NODE_SKIP.search(name) or name in used:
-				continue
-			if not await self._select(name):
-				continue
-			ip = await _query_egress_ip()
-			if not ip or ip in used:
-				continue  # 不可达，或与已试过的节点同 IP（同 IP 的 WAF 行为相同）
-			used.add(ip)
-			if await _probe_exit_passes_waf():
-				self._nodes.append(name)
-				self._ips.append(ip)
-		if not self._nodes:
-			await self.restore()
-			return False
-		_waf_pass_cache.update(ts=time.time(), nodes=list(self._nodes), ips=list(self._ips))
-		print(f'[AGENTROUTER] 出口探测完成：{len(self._ips)} 个能过 WAF 的独立 IP')
-		self._idx = -1
-		return True
-
-	async def next_ip(self) -> None:
-		"""切到下一个出口 IP；池子小就轮着用（轮与轮的间隔由调用方控制）。"""
-		if not self._nodes:
-			return
-		self._idx = (self._idx + 1) % len(self._nodes)
-		if await self._select(self._nodes[self._idx]):
-			global _exit_generation
-			_exit_generation += 1  # 逼后续请求重新建连，否则旧隧道还钉在上一个出口上
-
-	@property
-	def current(self) -> int:
-		"""当前用的是第几个出口 IP（-1 表示还没切过）"""
-		return self._idx
-
-
 _FATAL_LOGIN_MARKS = ('密码', '封禁', '限流', '429')
 
 
@@ -3040,45 +2836,6 @@ from server.keys import (  # noqa: E402
 app.include_router(keys_router)
 
 
-class _KeysExitRotator(_MihomoGroupSwitcher):
-	"""取密钥撞限流时的轻量出口轮换。
-
-	与 ExitRotator（agentrouter 专用，要探 WAF、能过的才进池）不同：这里撞的是站点自己的
-	频控而不是 WAF，不挑节点，只要实际出口 IP 没用过就行。所有请求都走一次性新建连接，
-	不存在 keep-alive 隧道钉死旧出口的问题（agentrouter 轮换踩过的坑）。
-	（留在本模块：继承自代理域的 _MihomoGroupSwitcher，类继承要求定义期就绑定基类。）
-	"""
-
-	def __init__(self):
-		super().__init__()
-		self.tried_ips: set[str] = set()
-
-	async def prepare(self) -> bool:
-		"""读节点列表、记住原节点。mihomo 不可用时返回 False（调用方就不轮换）。"""
-		ctl = _mihomo_controller()
-		if not ctl:
-			return False
-		self._base, self._secret = ctl
-		info = await self._api('GET', f'/proxies/{quote(MIHOMO_GROUP)}')
-		if not info or not info.get('all'):
-			return False
-		self._original = info.get('now')
-		self._nodes = [n for n in info['all'] if n != self._original and not MIHOMO_NODE_SKIP.search(n)]
-		return True
-
-	async def next_exit(self) -> bool:
-		"""切到下一个没用过的节点（按实际出口 IP 去重 —— 多个节点共用出口很常见）。"""
-		while self._idx + 1 < len(self._nodes):
-			self._idx += 1
-			if not await self._select(self._nodes[self._idx]):
-				continue
-			ip = await _query_egress_ip()
-			if ip:
-				if ip in self.tried_ips:
-					continue
-				self.tried_ips.add(ip)
-			return True
-		return False
 
 
 # ========== 每日用量统计（已迁至 server/usage.py） ==========
