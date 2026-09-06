@@ -69,9 +69,12 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
 - [x] 块D1 mihomo.py(switcher 底座、ExitRotator、_KeysExitRotator、探针、WAF pacing
       常量)。审核确认:_exit_generation 被测试观察/重绑,家在 bs,域内经 bs. 读写;
       MIHOMO_* env 常量归 config.py;WAF pacing 常量消费方仍在 bs 故留 bs(块D2 随迁)。
-- [ ] 块D2 agentrouter.py(登录 session、登录签到、登录余额;keys.py 的
-      `_agentrouter_session` 改为从本域导入)+ cookies.py(cookie 续期与余额)。
-      审核点:session 文件读写的 patch 目标;_run_with_rotation 随域迁移。
+- [x] 块D2 agentrouter.py(登录域全部逻辑:real_balance/query/sign_in、
+      checkin_gap_seconds、Login 状态助手、run/start_login_checkin、
+      _session_expiry_info、_run_with_rotation 轮换调度、login 余额)。7 端点鉴权一致。
+      _agentrouter_session 暂居 keys.py 经 bs. 引用(块E 归并);登录端点暂留主文件。
+- [ ] 块D3 cookies.py(cookie 域:WAF cookies、query_balance(+with_token)、
+      续期、cookie 签到)+ 块E 端点收尾 + 去晚绑定 + 测试 patch 目标迁移。
 - [ ] 块E 端点收尾 + 去晚绑定:cookie 域、token/site/login 端点路由、auth.py、
       webui.py;全部 bs.* 换真实导入;测试 patch 目标逐文件迁移。审核点:每改一个
       测试文件即跑该文件,最后全量。
