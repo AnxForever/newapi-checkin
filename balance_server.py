@@ -249,15 +249,6 @@ AGENTROUTER_ORG_CONFIG = {
 #      走浏览器脚本；GET 没挂中间件，随时可读状态
 #      （见 new-api 的 router/api-router.go：POST 带 middleware.TurnstileCheck()，GET 不带）
 # AnyRouter 与 AgentRouter 不在此列：前者要过阿里云 WAF + 走代理，后者只能账号密码登录。
-NEWAPI_DEFAULTS = {
-	'user_info_path': '/api/user/self',
-	'sign_in_path': '/api/user/checkin',
-	'status_path': '/api/status',
-	'api_user_key': 'new-api-user',
-	'quota_per_unit': 500000,
-	'concurrency': 10,
-	'accent': 'orange',
-}
 
 # 首次运行时写入 newapi_sites.json 的内容。gorouter 的数据文件名沿用历史命名，
 # 这样升级到通用实现后旧账号与签到状态原地可用，不需要迁移。
@@ -315,12 +306,6 @@ class LoginAccountItem(BaseModel):
 	password: str
 
 
-class NewapiAccountItem(BaseModel):
-	"""通用 new-api 站点的 Access Token 账号（来自各站点自己的 accounts_file）"""
-
-	name: str
-	access_token: str
-	user_id: str
 
 
 class CollectRequest(BaseModel):
@@ -357,32 +342,43 @@ def _set_site_status(site_id: str, status: str, error: str = '') -> None:
 _load_site_status()
 
 
-class NewapiSite(BaseModel):
-	"""一个 new-api 同构站点的配置。前端「站点管理」写入 newapi_sites.json，后端据此工作。
+# ========== 通用 new-api 站点域（已迁至 server/sites.py） ==========
+# 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；站点端点暂留主文件（块E 收口）。
+from server.sites import (  # noqa: E402
+	NEWAPI_DEFAULTS,
+	NewapiAccountItem,
+	NewapiSite,
+	newapi_checkin_states,
+	load_newapi_sites,
+	save_newapi_sites,
+	get_newapi_site,
+	load_newapi_accounts,
+	save_newapi_accounts,
+	_newapi_headers,
+	newapi_request,
+	_proxied_newapi_request,
+	query_balance_newapi,
+	newapi_turnstile_status,
+	sign_in_newapi,
+	newapi_checkin_info,
+	newapi_state,
+	add_newapi_checkin_log,
+	save_newapi_checkin_state,
+	load_newapi_checkin_state,
+	run_newapi_checkin,
+	start_newapi_checkin,
+	_newapi_checkin_status_payload,
+	run_site_patrol,
+	site_patrol_scheduler,
+	SITE_PATROL_INTERVAL,
+	SITE_PATROL_FIRST_DELAY,
+	SITE_PATROL_FAIL_LIMIT,
+)
 
-	`id` 决定接口路径（/api/site/{id}/...）与数据文件名，创建后不应再改；
-	`accounts_file` / `state_file` 允许显式指定，用于兼容 gorouter 的历史文件名。
-	"""
+# 巡检失败计数（测试会整体重绑，故家在 bs；sites.run_site_patrol 经 bs. 读写）
+site_patrol_fails: dict[str, int] = {}
 
-	id: str
-	label: str
-	domain: str
-	accent: str = 'orange'
-	user_info_path: str = NEWAPI_DEFAULTS['user_info_path']
-	sign_in_path: str = NEWAPI_DEFAULTS['sign_in_path']
-	status_path: str = NEWAPI_DEFAULTS['status_path']
-	api_user_key: str = NEWAPI_DEFAULTS['api_user_key']
-	quota_per_unit: int = NEWAPI_DEFAULTS['quota_per_unit']
-	concurrency: int = NEWAPI_CONCURRENCY
-	auto_checkin: bool = True
-	accounts_file: str = ''
-	state_file: str = ''
 
-	def accounts_path(self) -> Path:
-		return Path(__file__).parent / (self.accounts_file or f'{self.id}_accounts.json')
-
-	def state_path(self) -> Path:
-		return Path(__file__).parent / (self.state_file or f'{self.id}_checkin_state.json')
 
 
 class QueryRequest(BaseModel):
@@ -445,9 +441,6 @@ anyrouter_checkin_state: dict = {
 	'logs': [],
 }
 
-# 通用 new-api 站点的签到状态：site_id -> 状态字典，结构与上面两者一致。
-# 各站点互不影响，可同时签到；持久化到各站点自己的 state_file。
-newapi_checkin_states: dict[str, dict] = {}
 
 
 def _blank_checkin_state() -> dict:
@@ -1012,303 +1005,6 @@ def load_login_accounts() -> list[LoginAccountItem]:
 # 加一个新站点不需要改这里的任何代码，只要在前端「站点管理」里填域名即可。
 
 
-def load_newapi_sites() -> list[NewapiSite]:
-	"""读取 newapi_sites.json；文件不存在时用 NEWAPI_SEED_SITES 初始化后再读。"""
-	if not NEWAPI_SITES_FILE.exists():
-		try:
-			_atomic_write_json(NEWAPI_SITES_FILE, NEWAPI_SEED_SITES, indent=2)
-			print(f'[SITE] 已初始化 newapi_sites.json（{len(NEWAPI_SEED_SITES)} 个站点）')
-		except Exception as e:
-			print(f'[SITE] 初始化 newapi_sites.json 失败: {e}')
-			return [NewapiSite(**s) for s in NEWAPI_SEED_SITES]
-	return _read_json_models(NEWAPI_SITES_FILE, NewapiSite, 'SITE')
-
-
-def save_newapi_sites(sites: list[NewapiSite]):
-	"""写回站点清单"""
-	_atomic_write_json(NEWAPI_SITES_FILE, [s.model_dump() for s in sites], indent=2)
-
-
-def get_newapi_site(site_id: str) -> NewapiSite | None:
-	"""按 id 取站点配置，找不到返回 None"""
-	for s in load_newapi_sites():
-		if s.id == site_id:
-			return s
-	return None
-
-
-# ========== 站点健康自动巡检 ==========
-# 站点三态状态平时只在查询/签到时更新，死了的站点会一直挂在注册表里每天空跑
-# （实测出现过 521/522/404 的死站）。巡检调度器低频 GET /api/status（不挂中间件、
-# 1 站点 1 请求），连续 SITE_PATROL_FAIL_LIMIT 次不可达就自动暂停该站点的每日签到
-# 并推 webhook；恢复可达只更新状态，重新开启签到留给用户决定（站点可能换域名复活）。
-SITE_PATROL_INTERVAL = 6 * 3600  # 巡检间隔 6 小时
-SITE_PATROL_FIRST_DELAY = 300  # 启动 5 分钟后首巡（避开启动高峰）
-SITE_PATROL_FAIL_LIMIT = 3
-site_patrol_fails: dict[str, int] = {}
-
-
-async def run_site_patrol() -> None:
-	"""巡检一轮全部站点，更新三态状态并在持续失联时自动暂停签到"""
-	sites = load_newapi_sites()
-	if not sites:
-		return
-	for s in sites:
-		try:
-			resp = await newapi_request(s, 'GET', s.status_path, {'User-Agent': USER_AGENT})
-			ok = resp.status_code == 200
-			if ok:
-				try:
-					ok = bool((resp.json() or {}).get('data', {}).get('version'))
-				except Exception:
-					ok = False
-		except Exception:
-			ok = False
-
-		if ok:
-			if site_patrol_fails.get(s.id, 0) >= SITE_PATROL_FAIL_LIMIT:
-				add_newapi_checkin_log(s, '巡检：站点恢复可达（每日签到仍为暂停，请手动重新开启）')
-			site_patrol_fails[s.id] = 0
-			if _site_status.get(s.id, {}).get('status') == 'invalid':
-				_set_site_status(s.id, 'unknown', '')
-			continue
-
-		n = site_patrol_fails.get(s.id, 0) + 1
-		site_patrol_fails[s.id] = n
-		if n >= SITE_PATROL_FAIL_LIMIT and s.auto_checkin:
-			current = load_newapi_sites()
-			for s2 in current:
-				if s2.id == s.id:
-					s2.auto_checkin = False
-			save_newapi_sites(current)
-			msg = f'巡检：连续 {n} 次不可达，已自动暂停每日签到'
-			add_newapi_checkin_log(s, msg)
-			_set_site_status(s.id, 'invalid', f'巡检连续 {n} 次不可达')
-			if notify_configured():
-				_spawn(send_webhook_notify(
-					f'⚠️ {s.label} 已失联',
-					f'{s.domain} 连续 {n} 次巡检不可达，已自动暂停每日签到。\n站点恢复后请在站点管理重新开启自动签到。',
-				))
-
-
-async def site_patrol_scheduler():
-	"""低频巡检调度器：先等首巡延迟，然后每 6 小时一轮"""
-	await asyncio.sleep(SITE_PATROL_FIRST_DELAY)
-	while True:
-		try:
-			await run_site_patrol()
-		except Exception as e:
-			print(f'[PATROL] 巡检异常: {e}')
-		await asyncio.sleep(SITE_PATROL_INTERVAL)
-
-
-def load_newapi_accounts(site: NewapiSite) -> list[NewapiAccountItem]:
-	"""从站点自己的 accounts_file 加载账号列表"""
-	return _read_json_models(site.accounts_path(), NewapiAccountItem, site.id.upper())
-
-
-def save_newapi_accounts(site: NewapiSite, accounts: list[NewapiAccountItem]):
-	"""保存账号列表到站点自己的 accounts_file"""
-	_atomic_write_json(site.accounts_path(), [a.model_dump() for a in accounts], indent=2)
-
-
-def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
-	"""new-api 请求头：Bearer token + New-Api-User，两者缺一即 401"""
-	return {
-		'User-Agent': USER_AGENT,
-		'Accept': 'application/json, text/plain, */*',
-		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Referer': f'{site.domain}/console',
-		'Origin': site.domain,
-		'Authorization': f'Bearer {account.access_token}',
-		site.api_user_key: account.user_id,
-		'Cache-Control': 'no-store',
-	}
-
-
-async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None, _auto_bypass: bool = True):
-	"""向 new-api 站点发请求。这类站点在 Cloudflare 后，实测无需代理/WAF cookie，仍带 Chrome 指纹更稳。
-
-	Session 按站点分开复用（key 用 site.id），避免不同域名共用连接池。
-
-	撞上 CF 边缘质询或阿里云 WAF 挑战页时，解一次防护 cookies（按域名缓存 5 分钟）后
-	原地重打一次；有缓存就直接带上。cf_clearance 绑 UA，重试时用求解方返回的同一个 UA。
-	挑战页由防护层返回，请求没到过 new-api 源站，重试对签到是安全的（不会重复签）。
-	"""
-	url = site.domain + path
-	prot = protection_cache.get(site.domain.rstrip('/'))
-	if prot and (prot.get('failed') or prot['expires'] <= time.time()):
-		prot = None  # 负缓存/过期条目对请求方不可见；负缓存的拦截图在 ensure 里做
-	send_headers = dict(headers)
-	if prot and prot.get('user_agent'):
-		send_headers['User-Agent'] = prot['user_agent']
-
-	def _do():
-		sess = _get_cffi_session(f'newapi:{site.id}')
-		if prot:
-			sess.cookies.update(prot['cookies'])
-		return sess.request(method.upper(), url, headers=send_headers, json=json_body)
-
-	loop = asyncio.get_running_loop()
-	resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-	if not _auto_bypass:
-		return resp
-	kind = detect_protection(resp)
-	if kind is None:
-		return resp
-	if prot:
-		# 带着缓存的 cookies 仍撞质询：这条缓存已坏（被吊销/过期），作废后强制重解，
-		# 否则 ensure 会命中同一条「新鲜但无效」的缓存，拿同样的坏 cookies 白打一次
-		protection_cache.pop(site.domain.rstrip('/'), None)
-	entry = await ensure_protection_cookies(site, kind)
-	if not entry:
-		print(f'[{site.id.upper()}] 撞上 {kind} 防护但未能过验（CF 质询需在设置页配置 FlareSolverr）')
-		return resp
-	print(f'[{site.id.upper()}] 撞上 {kind} 防护，已过验并自动重试')
-	return await newapi_request(site, method, path, headers, json_body, _auto_bypass=False)
-
-
-async def _proxied_newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None):
-	"""经本地 mihomo 出口向站点发一次性请求（不复用 Session 池）。
-
-	newapi_request 是直连的（这类站点平时不需要代理）；只有撞「按出口 IP 限流」的端点
-	（取全量 key 的 batch/keys，20 次/20 分钟/IP）才借 mihomo 换出口。这里每次都新建连接，
-	不存在 keep-alive 隧道钉死旧出口的问题（agentrouter 轮换踩过的坑）。
-	"""
-	from curl_cffi import requests as cffi_requests
-
-	url = site.domain + path
-	proxies = {'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY}
-
-	def _do():
-		return cffi_requests.request(
-			method.upper(), url, headers=headers, json=json_body,
-			proxies=proxies, impersonate='chrome131', timeout=20,
-		)
-
-	loop = asyncio.get_running_loop()
-	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
-
-
-async def query_balance_newapi(site: NewapiSite, account: NewapiAccountItem) -> dict:
-	"""查询单个账号余额（access_token 方式）"""
-	headers = _newapi_headers(site, account)
-	unit = site.quota_per_unit or 500000
-	max_retries = 3
-	for attempt in range(max_retries):
-		try:
-			resp = await newapi_request(site, 'GET', site.user_info_path, headers)
-			if resp.status_code == 200:
-				data = resp.json()
-				if data.get('success'):
-					user_data = data.get('data', {})
-					return {
-						'name': account.name,
-						'success': True,
-						'quota': round(user_data.get('quota', 0) / unit, 2),
-						'used': round(user_data.get('used_quota', 0) / unit, 2),
-						'username': user_data.get('username', ''),
-					}
-				return {'name': account.name, 'success': False, 'error': f'API 返回失败: {data.get("message", "Unknown")}'}
-			return {'name': account.name, 'success': False, 'error': f'HTTP {resp.status_code}'}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': account.name, 'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-
-
-async def newapi_turnstile_status(site: NewapiSite) -> dict:
-	"""探测站点当前是否开着 Turnstile 人机校验，带 5 分钟缓存。
-
-	`GET /api/status` 会返回 `data.turnstile_check` 与 `data.turnstile_site_key`。
-	站长若哪天关掉 Turnstile，这里会自动变成 enabled=False，服务器端签到随即恢复可用，
-	前端也就不再需要走「浏览器脚本 + 同步」那条路 —— 无需改代码。
-
-	sitekey 一律从这里读，不要硬编码：它有域名限制，各站点各不相同。
-	探测失败时保守假定 enabled=True（宁可提示用户手动签，也别让自动签到静默失败）。
-	"""
-	cache_key = f'turnstile:{site.id}'
-	cached = waf_cache.get(cache_key)
-	if cached and cached['expires'] > time.time():
-		return cached['value']
-
-	value = {'enabled': True, 'site_key': '', 'probed': False}
-	try:
-		resp = await newapi_request(site, 'GET', site.status_path, {'User-Agent': USER_AGENT})
-		if resp.status_code == 200:
-			data = (resp.json() or {}).get('data', {}) or {}
-			value = {
-				'enabled': bool(data.get('turnstile_check')),
-				'site_key': data.get('turnstile_site_key') or '',
-				'probed': True,
-			}
-	except Exception as e:
-		print(f'[{site.id.upper()}] Turnstile 状态探测失败，保守假定已开启: {e}')
-
-	waf_cache[cache_key] = {'value': value, 'expires': time.time() + WAF_CACHE_TTL}
-	return value
-
-
-async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile_token: str | None = None) -> dict:
-	"""为单个账号签到（POST /api/user/checkin，奖励区间由站点配置决定）。
-
-	今日已签时接口返回 200 且 success=false、message='今日已签到'，据此区分 already。
-
-	turnstile_token 传入时签到 URL 带上 ?turnstile=<token> —— new-api 的 TurnstileCheck
-	中间件只认 query 参数，与前端浏览器脚本的传法一致。
-
-	站点开着 Turnstile 且没传 token 时，接口会返回「Turnstile token 为空」——
-	此时把 `turnstile_blocked` 标出来，让调用方知道这不是账号问题，而是需要先过人机校验。
-	"""
-	headers = _newapi_headers(site, account)
-	path = site.sign_in_path + (f'?turnstile={quote(turnstile_token, safe="")}' if turnstile_token else '')
-	max_retries = 3
-	for attempt in range(max_retries):
-		try:
-			resp = await newapi_request(site, 'POST', path, headers)
-			if resp.status_code == 200:
-				data = resp.json()
-				msg = data.get('message', '')
-				if data.get('success'):
-					return {'name': account.name, 'success': True, 'message': msg or '签到成功', 'already_signed': False}
-				if '已签' in msg:
-					return {'name': account.name, 'success': True, 'message': msg, 'already_signed': True}
-				if 'Turnstile' in msg:
-					return {'name': account.name, 'success': False, 'message': msg, 'turnstile_blocked': True}
-				return {'name': account.name, 'success': False, 'message': msg or '签到失败'}
-			return {'name': account.name, 'success': False, 'message': f'HTTP {resp.status_code}'}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
-
-
-async def newapi_checkin_info(site: NewapiSite, account: NewapiAccountItem) -> dict:
-	"""读取单个账号的签到状态（GET /api/user/checkin），不触发签到"""
-	unit = site.quota_per_unit or 500000
-	try:
-		resp = await newapi_request(site, 'GET', site.sign_in_path, _newapi_headers(site, account))
-		if resp.status_code != 200:
-			return {'name': account.name, 'success': False, 'error': f'HTTP {resp.status_code}'}
-		data = resp.json()
-		if not data.get('success'):
-			return {'name': account.name, 'success': False, 'error': data.get('message', 'Unknown')}
-		d = data.get('data', {})
-		stats = d.get('stats', {}) or {}
-		return {
-			'name': account.name,
-			'success': True,
-			'enabled': d.get('enabled'),
-			'min_reward': round((d.get('min_quota') or 0) / unit, 2),
-			'max_reward': round((d.get('max_quota') or 0) / unit, 2),
-			'checked_in_today': stats.get('checked_in_today'),
-			'total_checkins': stats.get('total_checkins'),
-			'total_reward': round((stats.get('total_quota') or 0) / unit, 2),
-		}
-	except Exception as e:
-		return {'name': account.name, 'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
 
 
 def add_checkin_log(msg: str):
@@ -1713,194 +1409,6 @@ def _anyrouter_checkin_status_payload() -> dict:
 # 每个站点一份独立状态，存在 newapi_checkin_states[site_id]，持久化到站点自己的 state_file。
 
 
-def newapi_state(site: NewapiSite) -> dict:
-	"""取（或初始化）某站点的签到状态"""
-	st = newapi_checkin_states.get(site.id)
-	if st is None:
-		st = _blank_checkin_state()
-		newapi_checkin_states[site.id] = st
-	return st
-
-
-def add_newapi_checkin_log(site: NewapiSite, msg: str):
-	_checkin_add_log(newapi_state(site), site.id.upper(), msg)
-
-
-def save_newapi_checkin_state(site: NewapiSite):
-	"""持久化签到状态"""
-	_checkin_save(newapi_state(site), site.state_path(), site.id.upper())
-
-
-def load_newapi_checkin_state(site: NewapiSite):
-	"""服务启动时恢复签到状态（仅用于前端展示历史进度）"""
-	_checkin_load(newapi_state(site), site.state_path(), site.id.upper())
-
-
-async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
-	"""执行某站点的签到：token 账号并发签到（Semaphore 取站点 concurrency），数秒内完成。
-
-	签到成功后顺便查一次余额写入今日快照，省去额外的查询请求。
-
-	站点开着 Turnstile 时分两种情况：配置了打码平台 → 先用免费的 GET 预检剔除今日已签
-	账号（token 按次计费，别替已签的白解），再逐账号求解并签到（全自动）；没配置 → 先
-	探测一次并直接结束，把原因写进日志。站长关掉 Turnstile 后无需改代码，此路径自动恢复。
-	"""
-	accounts = load_newapi_accounts(site)
-	st = newapi_state(site)
-	today = datetime.now().strftime('%Y-%m-%d')
-	st['running'] = True
-	st['date'] = today
-	st['trigger'] = trigger
-	st['started_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	st['finished_at'] = None
-	st['total'] = len(accounts)
-	st['signed'] = 0
-	st['already'] = 0
-	st['failed'] = 0
-	st['accounts'] = {a.name: {'status': 'pending', 'message': '等待签到', 'time': None} for a in accounts}
-	st['logs'] = []
-	add_newapi_checkin_log(site, f'开始 {site.label} 签到（{trigger}），共 {len(accounts)} 个 token 账号')
-	save_newapi_checkin_state(site)
-
-	def _finish():
-		st['signed'] = sum(1 for v in st['accounts'].values() if v['status'] == 'signed')
-		st['already'] = sum(1 for v in st['accounts'].values() if v['status'] == 'already')
-		st['failed'] = sum(1 for v in st['accounts'].values() if v['status'] == 'failed')
-		st['running'] = False
-		st['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		add_newapi_checkin_log(
-			site, f'{site.label} 签到结束：成功 {st["signed"]} · 今日已签 {st["already"]} · 失败 {st["failed"]}'
-		)
-		save_newapi_checkin_state(site)
-		# 失败推 webhook（默认关，设置页可开）——失败只在日志里等用户翻页发现不了
-		if st['failed'] > 0 and notify_configured() and get_notify_config()['on_checkin_failed']:
-			bad = [f'{name}：{v["message"][:60]}' for name, v in st['accounts'].items() if v['status'] == 'failed']
-
-			async def _push_failure():
-				r = await send_webhook_notify(f'❌ {site.label} 签到失败 {st["failed"]} 个', '\n'.join(bad))
-				if not r.get('sent'):
-					add_newapi_checkin_log(site, f'失败通知推送未发送：{r.get("error", "")}')
-
-			_spawn(_push_failure())
-
-	if not accounts:
-		add_newapi_checkin_log(site, f'没有 {site.label} 账号，签到结束')
-		_finish()
-		return
-
-	ts_state = await newapi_turnstile_status(site)
-	ts_enabled = bool(ts_state['enabled'])
-	ts_site_key = ts_state['site_key'] or ''
-	if ts_enabled:
-		solver_cfg = get_turnstile_solver_config()
-		if not solver_cfg['api_key']:
-			ts_msg = '站点已开启 Turnstile 人机校验且未配置打码平台，服务器端无法签到；请在设置页配置打码平台，或用 Web UI 的浏览器脚本签到'
-			now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-			for name in st['accounts']:
-				st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
-			add_newapi_checkin_log(site, ts_msg)
-			_finish()
-			return
-		if not ts_site_key:
-			# 探测失败时 status 保守返回 enabled=True 但没有 sitekey，没东西可解，只能走浏览器
-			ts_msg = '站点 Turnstile 状态探测失败拿不到 sitekey，无法服务器端求解；请稍后重试或用浏览器脚本签到'
-			now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-			for name in st['accounts']:
-				st['accounts'][name] = {'status': 'failed', 'message': ts_msg, 'time': now_str}
-			add_newapi_checkin_log(site, ts_msg)
-			_finish()
-			return
-		add_newapi_checkin_log(
-			site, f"站点开启 Turnstile，改用打码平台（{solver_cfg['provider'] or '自定义网关'}）逐账号求解 token"
-		)
-		page_url = site.domain.rstrip('/') + '/login'
-
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
-	if ts_enabled:
-		# Turnstile token 按次计费：先用不挂中间件的 GET 状态把今日已签的剔掉，
-		# 别替已签账号白解 token（与前端浏览器脚本的「先 sync 再生成」同一思路）。
-		# 查询失败的账号按未签处理，宁可多花一次打码也不漏签。
-		async def _preflight(acc: NewapiAccountItem):
-			async with sem:
-				return acc, await newapi_checkin_info(site, acc)
-
-		pending: list[NewapiAccountItem] = []
-		for acc, info in await asyncio.gather(*[_preflight(a) for a in accounts]):
-			if info.get('success') and info.get('checked_in_today'):
-				ts_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-				st['accounts'][acc.name] = {'status': 'already', 'message': '今日已签（打码预检跳过）', 'time': ts_now}
-			else:
-				pending.append(acc)
-		skipped = len(accounts) - len(pending)
-		if skipped:
-			add_newapi_checkin_log(site, f'打码预检：{skipped} 个账号今日已签，跳过求解')
-		if not pending:
-			_finish()
-			return
-
-	async def _one(acc: NewapiAccountItem):
-		async with sem:
-			if not st['running']:
-				return
-			ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-			token = None
-			if ts_enabled:
-				solved = await solve_turnstile_token(ts_site_key, page_url)
-				if not solved.get('success'):
-					msg = f"过验失败: {solved.get('error', '未知错误')}"
-					st['accounts'][acc.name] = {'status': 'failed', 'message': msg, 'time': ts}
-					add_newapi_checkin_log(site, f'{acc.name}: {msg}')
-					save_newapi_checkin_state(site)
-					return
-				token = solved['token']
-			result = await sign_in_newapi(site, acc, turnstile_token=token)
-			if result.get('success'):
-				status = 'already' if result.get('already_signed') else 'signed'
-				st['accounts'][acc.name] = {'status': status, 'message': result.get('message', '签到成功'), 'time': ts}
-				bal = await query_balance_newapi(site, acc)
-				if bal.get('success'):
-					record_account_usage(site.id, acc.name, bal['used'], bal['quota'])
-			else:
-				st['accounts'][acc.name] = {'status': 'failed', 'message': result.get('message', '签到失败'), 'time': ts}
-			add_newapi_checkin_log(site, f'{acc.name}: {st["accounts"][acc.name]["message"]}')
-			save_newapi_checkin_state(site)
-
-	await asyncio.gather(*[_one(a) for a in (pending if ts_enabled else accounts)])
-	_finish()
-
-
-def start_newapi_checkin(site: NewapiSite, trigger: str = 'manual') -> bool:
-	"""启动某站点的签到任务，若已在运行则返回 False"""
-	st = newapi_state(site)
-	if st['running']:
-		return False
-	st['task'] = asyncio.create_task(run_newapi_checkin(site, trigger))
-	return True
-
-
-def _newapi_checkin_status_payload(site: NewapiSite) -> dict:
-	"""组装签到状态返回体"""
-	st = newapi_state(site)
-	accounts = [
-		{'name': name, 'status': info.get('status', 'pending'), 'message': info.get('message', ''), 'time': info.get('time')}
-		for name, info in st['accounts'].items()
-	]
-	signed = sum(1 for a in accounts if a['status'] in ('signed', 'already'))
-	failed = sum(1 for a in accounts if a['status'] == 'failed')
-	return {
-		'site_id': site.id,
-		'running': st['running'],
-		'date': st['date'],
-		'trigger': st['trigger'],
-		'started_at': st['started_at'],
-		'finished_at': st['finished_at'],
-		'total': st['total'],
-		'done': signed + failed,
-		'signed': signed,
-		'failed': failed,
-		'accounts': accounts,
-		'logs': st['logs'][-30:],
-	}
 
 
 def save_renewed_sessions(updates: dict):

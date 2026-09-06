@@ -62,9 +62,10 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
 - [x] 块B 通知与防护:notify.py、protection.py、turnstile.py。审核确认:被测内部
       调用（ensure 的求解、protection_test 的探测）必须走 bs. 才能被 patch 拦截——
       发现并修复 2 处;9 端点鉴权一致;阿里云 WAF 算法随 protection 迁移。
-- [ ] 块C 站点域:sites.py(注册表 + newapi_request 自动过验 + 签到调度 + 打码预检 +
-      站点巡检)。审核点:newapi_request 对 protection 的依赖方向(sites→protection,
-      不得反向)。
+- [x] 块C 站点域:sites.py(注册表 + newapi_request 自动过验 + 签到调度 + 打码预检 +
+      站点巡检)。审核确认:依赖方向 sites→protection 正确;NEWAPI_SEED_SITES/
+      site_patrol_fails 被测试重绑故留 bs,站点端点暂留主文件（块E 收口）;
+      NewapiSite 路径方法经 bs.__file__ 解析根目录（迁移后 __file__ 指向 server/）。
 - [ ] 块D 代理与登录:mihomo.py(switcher 底座与两个 Rotator)+ agentrouter.py
       (登录 session、登录签到、登录余额;keys.py 的 `_agentrouter_session` 改为
       从本域导入——去耦 keys 与 agentrouter)。审核点:session 文件读写的 patch 目标。
