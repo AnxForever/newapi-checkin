@@ -4384,422 +4384,50 @@ async def site_checkin_info_all(site_id: str):
 
 
 # ========== 密钥管理（new-api 的「令牌」/api/token/） ==========
-# 四类账号（anyrouter token / anyrouter cookie / agentrouter login / 通用站点）跑的都是
-# new-api，密钥接口完全同名，差别只在三处，全部收敛进 KeyCtx 这一层：
-#   1. 怎么认证：Bearer access_token（token/site）还是 session cookie（cookie/login）
-#   2. 列表形态：旧版 `data` 直接是数组（anyrouter v0.0.0），新版是 {page,total,items}
-#      （agentrouter、gorouter、tabitoken 均如此）—— `_parse_token_items()` 两种都吃
-#   3. key 是否脱敏：新版列表只给 `U8rl**********sRVH`，要再打一次才拿得到全量
-#      （gorouter/tabitoken 如此；agentrouter 直接给明文 48 位）
-# 所以上层三个端点是站点无关的，以后加站点同样零改动。
+# 实现已迁至 server/keys.py（拆分第一块）。过渡期约定：
+#   - keys.py 不做模块级 import balance_server（防循环导入），函数体内对账号加载器、
+#     请求通道、可变缓存等一切跨实体引用晚绑定 bs.<名字> —— 测试对 bs 命名空间的
+#     monkeypatch（resolve_key_ctx / _agentrouter_session / _KeysExitRotator /
+#     KEYS_CACHE_FILE 等）因此原样生效，本块迁移零测试改动；
+#   - 文件路径常量留在本模块（测试会改写它们指向 tmp）；
+#   - 后续域迁移时逐步把 bs.* 换成真正的模块内依赖，patch 目标随之迁移。
 TOKEN_LIST_PATH = '/api/token/'
 TOKEN_PAGE_SIZE = 100
-
-# 全量 key 的缓存：`{ref}:{token_id}` -> key。取全量 key 的上游端点挂着 CriticalRateLimit
-# （**20 次 / 20 分钟 / 出口 IP**，见 new-api 的 middleware/rate-limit.go + common/init.go），
-# 账号一多就会撞上，所以取到就一直留着 —— 同一个 token id 的 key 不会变，只在删除时清掉。
-_key_value_cache: dict[str, str] = {}
-
-# 密钥**列表**的缓存：`ref|账号名` -> {'ts', 'result'}，落盘 keys_cache.json。
-# 密钥很少变（本界面的建/删会带 refresh 重列并回写），所以成功结果一直缓存，
-# 打开弹窗零上游请求；额度/最近使用这类会漂的字段想看新的就点刷新（refresh=True）。
-# key 里带账号名：ref 是位置索引，账号增删后同一个 ref 可能指向别的账号，名字对不上就当未命中。
-# 缓存里直接存**全量成品**（用户要求打开就能看到完整密钥、复制零上游请求）；
-# 限流取不到全量时才退化为脱敏列表，下次命中缓存会自动补取一次再回写。
 KEYS_CACHE_FILE = Path(__file__).parent / 'keys_cache.json'
 KEYS_CACHE_MAX_AGE = 30 * 24 * 3600  # 保存时清掉一个月没碰过的条目，防无限增长
-_keys_list_cache: dict = {}
-
-
-def load_keys_list_cache():
-	"""启动时恢复密钥列表缓存（与其它数据文件一样，读写都容错）"""
-	global _keys_list_cache
-	try:
-		data = json.loads(KEYS_CACHE_FILE.read_text(encoding='utf-8'))
-		if isinstance(data, dict):
-			_keys_list_cache = data
-	except Exception:
-		_keys_list_cache = {}
-
-
-def save_keys_list_cache():
-	try:
-		now = time.time()
-		for k in [k for k, v in _keys_list_cache.items() if now - v.get('ts', 0) > KEYS_CACHE_MAX_AGE]:
-			_keys_list_cache.pop(k, None)
-		_atomic_write_json(KEYS_CACHE_FILE, _keys_list_cache)
-	except Exception as e:
-		print(f'[KEYS] 列表缓存写盘失败: {e}')
-
-# agentrouter 只能账号密码登录，而**登录接口按出口 IP 限流，打满会连续返回 429（空响应体）**
-# ——2026-08-17 实测：半小时内约 60 次登录就被限住了。所以 session 必须缓存复用，
-# 并落盘到 AGENTROUTER_SESSION_FILE：不落盘的话每次重启服务后的第一次查询就是 18 次登录，
-# 稳定把自己打进限流。TTL 给足（session 本身有效期远长于此），过期或失效时自动重登。
-_agentrouter_key_sessions: dict[str, dict] = {}
 AGENTROUTER_SESSION_TTL = 6 * 3600
 AGENTROUTER_SESSION_FILE = Path(__file__).parent / 'agentrouter_sessions.json'
-_agentrouter_login_lock = asyncio.Lock()
 
-
-def load_agentrouter_sessions():
-	"""启动时恢复缓存的 agentrouter session，避免重启后的第一次查询打满登录限流"""
-	if not AGENTROUTER_SESSION_FILE.exists():
-		return
-	try:
-		data = json.loads(AGENTROUTER_SESSION_FILE.read_text(encoding='utf-8'))
-	except Exception as e:
-		print(f'[AGENTROUTER] 读取 session 缓存失败: {e}')
-		return
-	now = time.time()
-	kept = {k: v for k, v in data.items() if isinstance(v, dict) and v.get('expires', 0) > now}
-	_agentrouter_key_sessions.update(kept)
-	if kept:
-		print(f'[AGENTROUTER] 恢复了 {len(kept)} 个 session 缓存')
-
-
-def save_agentrouter_sessions():
-	try:
-		_atomic_write_json(AGENTROUTER_SESSION_FILE, _agentrouter_key_sessions, indent=2)
-	except Exception as e:
-		print(f'[AGENTROUTER] 保存 session 缓存失败: {e}')
-
-
-class KeyCtx:
-	"""一个账号的密钥操作上下文：request 闭包封装了该账号怎么发请求，上层不用关心类型"""
-
-	def __init__(self, ref: str, name: str, provider: str, request, quota_per_unit: int = 500000, proxied_request=None):
-		self.ref = ref
-		self.name = name
-		self.provider = provider
-		self.request = request
-		self.quota_per_unit = quota_per_unit or 500000
-		# 走 mihomo 出口的备用请求（签名同 request）。取全量 key 撞「按出口 IP 限流」时
-		# 靠它换出口重试；None 表示该类账号没有可轮换的通道。
-		self.proxied_request = proxied_request
-
-
-async def _agentrouter_session(account: LoginAccountItem, force: bool = False) -> tuple[dict, str]:
-	"""登录 agentrouter 换 session cookie，带缓存。返回 (cookies, user_id)
-
-	缓存的意义不只是快：登录接口按 IP 限流，而 agentrouter「登录即签到」——
-	复用 session 既少打限流，也避免查余额时顺带触发签到。
-	"""
-	cached = _agentrouter_key_sessions.get(account.name)
-	if not force and cached and cached['expires'] > time.time():
-		return cached['cookies'], cached['user_id']
-
-	config = AGENTROUTER_ORG_CONFIG
-	proxies = {'https': _AGENTROUTER_PROXY}
-
-	def _do():
-		sess = _get_cffi_session(_ar_session_key('agentrouter-keys'), proxies)
-		resp = sess.post(
-			f'{config["domain"]}{config["login_path"]}',
-			json={'username': account.username, 'password': account.password},
-			timeout=15,
-		)
-		return resp, dict(sess.cookies)
-
-	loop = asyncio.get_running_loop()
-	# 登录接口按 IP 限流，串行 + 间隔，别让批量操作把窗口打满
-	async with _agentrouter_login_lock:
-		resp, jar = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-		await asyncio.sleep(1.5)
-	# 429 的响应体是空的，直接 resp.json() 会抛 JSONDecodeError，
-	# 报出来是「Expecting value: line 1 column 1」这种看不懂的错 —— 必须先认出限流。
-	if resp.status_code == 429:
-		raise RuntimeError('登录被站点限流（429），请等几分钟再试')
-	if resp.status_code != 200:
-		raise RuntimeError(f'登录失败: HTTP {resp.status_code}')
-	try:
-		data = resp.json()
-	except Exception:
-		raise RuntimeError(f'登录响应不是 JSON（HTTP {resp.status_code}）') from None
-	if not data.get('success'):
-		raise RuntimeError(f'登录失败: {data.get("message", "Unknown")}')
-	user_id = str((data.get('data') or {}).get('id') or '')
-	if not user_id:
-		raise RuntimeError('登录成功但没拿到 user id')
-	_agentrouter_key_sessions[account.name] = {
-		'cookies': jar,
-		'user_id': user_id,
-		'expires': time.time() + AGENTROUTER_SESSION_TTL,
-	}
-	save_agentrouter_sessions()
-	return jar, user_id
-
-
-async def resolve_key_ctx(ref: str) -> tuple[KeyCtx | None, str | None]:
-	"""把前端的账号引用（token:3 / cookie:0 / login:2 / site:tabitoken:0）解析成 KeyCtx。
-
-	格式与前端账号卡的 `_ref` 完全一致，这样前端不用再维护第二套寻址方式。
-	"""
-	parts = str(ref).split(':')
-	kind = parts[0] if parts else ''
-
-	def _idx(pos: int) -> int | None:
-		try:
-			return int(parts[pos])
-		except (IndexError, ValueError):
-			return None
-
-	if kind in ('token', 'cookie'):
-		idx = _idx(1)
-		accounts = load_token_accounts() if kind == 'token' else load_cookie_accounts()
-		if idx is None or idx < 0 or idx >= len(accounts):
-			return None, f'账号引用 {ref} 无效'
-		account = accounts[idx]
-		config = ANYROUTER_CONFIG
-		waf = await _get_waf_cookies_if_needed()
-		headers = {
-			'User-Agent': USER_AGENT,
-			'Accept': 'application/json, text/plain, */*',
-			'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-			'Referer': config['domain'],
-			'Origin': config['domain'],
-		}
-		if kind == 'token':
-			headers['Authorization'] = f'Bearer {account.access_token}'
-			headers[config['api_user_key']] = account.user_id
-			cookies = dict(waf)
-		else:
-			headers[config['api_user_key']] = account.api_user
-			cookies = {**waf, **account.cookies}
-
-		async def _req(method, path, json_body=None, _h=headers, _c=cookies):
-			resp = await anyrouter_request(method, _api_url(path), _h, cookies=_c, json_body=json_body)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				raise RuntimeError(blocked[1])
-			return resp
-
-		return KeyCtx(ref, account.name, 'AnyRouter', _req), None
-
-	if kind == 'login':
-		idx = _idx(1)
-		accounts = load_login_accounts()
-		if idx is None or idx < 0 or idx >= len(accounts):
-			return None, f'账号引用 {ref} 无效'
-		account = accounts[idx]
-		config = AGENTROUTER_ORG_CONFIG
-		try:
-			cookies, user_id = await _agentrouter_session(account)
-		except Exception as e:
-			return None, f'{account.name}: {e}'
-		proxies = {'https': _AGENTROUTER_PROXY}
-		headers = {
-			'User-Agent': USER_AGENT,
-			'Accept': 'application/json, text/plain, */*',
-			'Referer': config['domain'],
-			'new-api-user': user_id,
-		}
-
-		async def _req(method, path, json_body=None, _h=headers, _c=cookies):
-			def _do():
-				sess = _get_cffi_session('agentrouter-keys-req', proxies)
-				return sess.request(
-					method.upper(), f'{config["domain"]}{path}', headers=_h, cookies=_c, json=json_body, timeout=20
-				)
-
-			loop = asyncio.get_running_loop()
-			return await loop.run_in_executor(_UPSTREAM_POOL, _do)
-
-		return KeyCtx(ref, account.name, 'AgentRouter', _req), None
-
-	if kind == 'site':
-		if len(parts) < 3:
-			return None, f'账号引用 {ref} 无效'
-		site = get_newapi_site(parts[1])
-		if site is None:
-			return None, f'站点 {parts[1]} 不存在'
-		accounts = load_newapi_accounts(site)
-		idx = _idx(2)
-		if idx is None or idx < 0 or idx >= len(accounts):
-			return None, f'账号引用 {ref} 无效'
-		account = accounts[idx]
-		headers = _newapi_headers(site, account)
-
-		async def _req(method, path, json_body=None, _s=site, _h=headers):
-			return await newapi_request(_s, method, path, _h, json_body=json_body)
-
-		async def _proxied(method, path, json_body=None, _s=site, _h=headers):
-			return await _proxied_newapi_request(_s, method, path, _h, json_body=json_body)
-
-		return KeyCtx(ref, account.name, site.label, _req, site.quota_per_unit, proxied_request=_proxied), None
-
-	return None, f'未知的账号类型：{ref}'
-
-
-def _parse_token_items(data) -> list[dict]:
-	"""列表响应有两种形态：旧版 data 直接是数组，新版是 {page,page_size,total,items}"""
-	if isinstance(data, dict):
-		return data.get('items') or []
-	if isinstance(data, list):
-		return data
-	return []
-
-
-def _token_row(t: dict, unit: int) -> dict:
-	"""把上游的令牌对象整理成前端要展示的字段。额度按站点的 quota_per_unit 换算成美元。"""
-	key = t.get('key') or ''
-	return {
-		'id': t.get('id'),
-		'name': t.get('name') or '',
-		'key': key,
-		'masked': '*' in key,
-		'status': t.get('status'),
-		'unlimited_quota': bool(t.get('unlimited_quota')),
-		'remain_quota': round((t.get('remain_quota') or 0) / unit, 2),
-		'used_quota': round((t.get('used_quota') or 0) / unit, 2),
-		'expired_time': t.get('expired_time'),
-		'created_time': t.get('created_time'),
-		'accessed_time': t.get('accessed_time'),
-		'group': t.get('group') or '',
-		'model_limits_enabled': bool(t.get('model_limits_enabled')),
-		'model_limits': t.get('model_limits') or '',
-		'allow_ips': t.get('allow_ips') or '',
-	}
-
-
-async def reveal_key_values(ctx: KeyCtx, rows: list[dict], request=None) -> str | None:
-	"""把脱敏的 key 换成全量值（就地改 rows）。返回警告文案，None 表示全部拿到。
-
-	默认走 ctx.request（与该账号平时一致的通道）；`request=` 可注入别的出口 ——
-	撞限流轮换时传 ctx.proxied_request，让这次请求经 mihomo 的新出口出去。
-	优先用 `POST /api/token/batch/keys` —— 一次请求拿一个账号的全部 key，
-	而它和逐个取的 `POST /api/token/{id}/key` 共享同一个 20 次/20 分钟/IP 的配额，
-	所以账号多的时候「批量」是唯一可行的方式。
-	"""
-	req = request or ctx.request
-	need = []
-	for r in rows:
-		if not r['masked']:
-			continue
-		cached = _key_value_cache.get(f'{ctx.ref}:{r["id"]}')
-		if cached:
-			r['key'], r['masked'] = cached, False
-		else:
-			need.append(r)
-	if not need:
-		return None
-
-	ids = [r['id'] for r in need if r['id'] is not None]
-	try:
-		resp = await req('POST', '/api/token/batch/keys', {'ids': ids})
-	except Exception as e:
-		return f'取完整密钥失败：{e}'
-	if resp.status_code == 429:
-		return '站点限流（取密钥 20 次/20 分钟），请稍后再试'
-	if resp.status_code in (401, 403):
-		# 认证问题重试也没用，别掉进下面「没有 batch 端点」的逐个取兜底（tb0 实测：
-		# access_token 失效时 batch 与逐个全 401，最后报成「N 个密钥未取到完整值」，看不出根因）
-		try:
-			msg = resp.json().get('message') or f'HTTP {resp.status_code}'
-		except Exception:
-			msg = f'HTTP {resp.status_code}'
-		return f'取完整密钥失败：{msg}（该账号的 access_token 可能已失效，请更新后重试）'
-	if resp.status_code == 200:
-		try:
-			data = resp.json()
-		except Exception:
-			data = {}
-		if data.get('success'):
-			keys = (data.get('data') or {}).get('keys') or {}
-			missing = 0
-			for r in need:
-				full = keys.get(str(r['id'])) or keys.get(r['id'])
-				if full:
-					r['key'], r['masked'] = full, False
-					_key_value_cache[f'{ctx.ref}:{r["id"]}'] = full
-				else:
-					missing += 1
-			return f'{missing} 个密钥未取到完整值' if missing else None
-		return f'取完整密钥失败：{data.get("message") or "Unknown"}'
-
-	# 旧版本可能没有 batch 端点，退回逐个取。同样吃 20 次/20 分钟的配额，
-	# 所以只在密钥不多时才走，免得一个账号就把配额耗光。
-	if len(need) > 5:
-		return f'该站点不支持批量取密钥，且待取 {len(need)} 个超过单账号上限，请逐个查看'
-	failed = 0
-	for r in need:
-		try:
-			one = await req('POST', f'/api/token/{r["id"]}/key')
-			full = ((one.json() or {}).get('data') or {}).get('key') if one.status_code == 200 else None
-		except Exception:
-			full = None
-		if full:
-			r['key'], r['masked'] = full, False
-			_key_value_cache[f'{ctx.ref}:{r["id"]}'] = full
-		else:
-			failed += 1
-	return f'{failed} 个密钥未取到完整值' if failed else None
-
-
-async def list_account_keys(ctx: KeyCtx, refresh: bool = False, reveal: bool = True) -> dict:
-	"""列出一个账号的密钥；reveal=True（默认）顺手把脱敏的 key 换成全量（前端要直接展示完整密钥）。
-
-	取全量走 `reveal_key_values`（值另进 `_key_value_cache`），拿到后把**全量成品**写进列表缓存，
-	之后打开弹窗、复制都零上游请求；限流拿不到时保持脱敏并带 `warning`，
-	下次命中缓存还会自动补取一次再回写（旧版缓存文件里只有脱敏列表，靠这步无痛升级）。
-	keys_list 端点传 reveal=False —— 取全量是 20 次/20 分钟/IP 的限流资源且**跨账号共享**，
-	由端点层的 `_reveal_accounts` 统一协调（小批推进 + 撞限流自动换出口）；
-	单账号调用方（建/删后重列）保持默认 True。
-	refresh=False 且有缓存时直接回缓存，结果带 `cached_at` 供前端标注时间。
-	"""
-	base = {'ref': ctx.ref, 'name': ctx.name, 'provider': ctx.provider}
-	ckey = f'{ctx.ref}|{ctx.name}'
-	if not refresh:
-		hit = _keys_list_cache.get(ckey)
-		if hit:
-			out = json.loads(json.dumps(hit['result']))
-			if reveal and any(k.get('masked') for k in out.get('keys', [])):
-				out['warning'] = await reveal_key_values(ctx, out['keys'])
-				hit['result'] = json.loads(json.dumps(out))
-				save_keys_list_cache()
-			out['cached'] = True
-			out['cached_at'] = hit.get('ts')
-			return out
-	try:
-		resp = await ctx.request('GET', f'{TOKEN_LIST_PATH}?p=1&page_size={TOKEN_PAGE_SIZE}')
-	except Exception as e:
-		return {**base, 'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-	if resp.status_code != 200:
-		return {**base, 'success': False, 'error': f'HTTP {resp.status_code}'}
-	try:
-		data = resp.json()
-	except Exception:
-		return {**base, 'success': False, 'error': '响应不是 JSON（可能被拦截）'}
-	if not data.get('success'):
-		return {**base, 'success': False, 'error': data.get('message') or 'Unknown'}
-
-	payload = data.get('data')
-	items = _parse_token_items(payload)
-	total = payload.get('total') if isinstance(payload, dict) else len(items)
-	rows = [_token_row(t, ctx.quota_per_unit) for t in items]
-	result = {
-		**base,
-		'success': True,
-		'keys': rows,
-		'total': total if isinstance(total, int) else len(rows),
-		'truncated': isinstance(total, int) and total > len(rows),
-		'warning': await reveal_key_values(ctx, rows) if reveal else None,
-	}
-	stored = json.loads(json.dumps(result))  # 深拷贝：调用方会就地改 rows，不能穿透进缓存
-	stored.pop('warning', None)  # warning 是瞬时状态（限流提示），别带进缓存
-	_keys_list_cache[ckey] = {'ts': time.time(), 'result': stored}
-	save_keys_list_cache()
-	return result
-
-
-# ===== 取全量 key 的跨账号协调（限流是 20 次/20 分钟/出口 IP，全端点共享） =====
-# tabitoken 29 个账号 > 20：直连一轮只够前 20 个，后面的必 429。而且 newapi_request 是
-# **直连**（这类站点平时不需要代理），用户换 mihomo 节点对这些请求毫无作用 —— 出口 IP
-# 一直是本机。所以撞限流时由后端自己切 mihomo 出口，请求走一次性新连接（见 _proxied_newapi_request）。
-KEYS_REVEAL_CONCURRENCY = 4  # 列表接口可以猛并发，取全量是限流资源，小批推进
-KEYS_REVEAL_MAX_SWITCHES = 6  # 最多换 6 个出口（每个出口 20 次/20 分钟，29 个账号最多用 2 个）
-KEYS_REVEAL_LIMIT_WINDOW = 20 * 60
-_keys_reveal_until: dict[str, float] = {}  # 按站点/账号类型的熔断时间戳（限流按 IP 计，不同站点独立）
-_keys_reveal_lock = asyncio.Lock()  # 同时只允许一轮「取全量」——它会切 mihomo 节点
+from server.keys import (  # noqa: E402
+	KeyCtx,
+	_key_value_cache,
+	_keys_list_cache,
+	_agentrouter_key_sessions,
+	_agentrouter_login_lock,
+	_keys_reveal_until,
+	_keys_reveal_lock,
+	KEYS_REVEAL_CONCURRENCY,
+	KEYS_REVEAL_MAX_SWITCHES,
+	KEYS_REVEAL_LIMIT_WINDOW,
+	load_keys_list_cache,
+	save_keys_list_cache,
+	load_agentrouter_sessions,
+	save_agentrouter_sessions,
+	_agentrouter_session,
+	resolve_key_ctx,
+	_parse_token_items,
+	_token_row,
+	reveal_key_values,
+	list_account_keys,
+	_reveal_scope,
+	_keys_cache_store_if_complete,
+	_reveal_accounts,
+	keys_list,
+	keys_create,
+	keys_delete,
+	keys_router,
+)
+app.include_router(keys_router)
 
 
 class _KeysExitRotator(_MihomoGroupSwitcher):
@@ -4808,6 +4436,7 @@ class _KeysExitRotator(_MihomoGroupSwitcher):
 	与 ExitRotator（agentrouter 专用，要探 WAF、能过的才进池）不同：这里撞的是站点自己的
 	频控而不是 WAF，不挑节点，只要实际出口 IP 没用过就行。所有请求都走一次性新建连接，
 	不存在 keep-alive 隧道钉死旧出口的问题（agentrouter 轮换踩过的坑）。
+	（留在本模块：继承自代理域的 _MihomoGroupSwitcher，类继承要求定义期就绑定基类。）
 	"""
 
 	def __init__(self):
@@ -4840,189 +4469,6 @@ class _KeysExitRotator(_MihomoGroupSwitcher):
 				self.tried_ips.add(ip)
 			return True
 		return False
-
-
-def _reveal_scope(ctx: KeyCtx) -> str:
-	"""限流熔断的维度：站点账号按站点，其余按账号类型（不同站点的限流互相独立）。"""
-	parts = ctx.ref.split(':')
-	return ':'.join(parts[:2]) if parts[0] == 'site' else parts[0]
-
-
-def _keys_cache_store_if_complete(ctx: KeyCtx, acc: dict) -> None:
-	"""账号的 key 全部拿到全量后回写列表缓存（warning/cached 等瞬态字段不落盘，深拷贝防穿透）。"""
-	if not acc.get('success') or any(k.get('masked') for k in acc.get('keys', [])):
-		return
-	stored = json.loads(json.dumps({k: v for k, v in acc.items() if k not in ('warning', 'cached', 'cached_at')}))
-	_keys_list_cache[f'{ctx.ref}|{ctx.name}'] = {'ts': time.time(), 'result': stored}
-	save_keys_list_cache()
-
-
-async def _reveal_accounts(pairs: list[tuple[KeyCtx | None, dict]]) -> None:
-	"""把各账号列表里的脱敏 key 统一取成全量（跨账号协调 + 撞限流自动换出口）。
-
-	限流跨账号共享：各账号并发猛打必然后面全 429。这里小批推进，撞 429 先切 mihomo 出口
-	重试（经一次性新连接，必然走新出口），出口用尽才熔断 KEYS_REVEAL_LIMIT_WINDOW（期间不再打上游）。
-	成功一个账号就回写列表缓存，之后打开零上游。
-	"""
-	pending = [
-		(ctx, acc) for ctx, acc in pairs
-		if ctx is not None and acc.get('success') and any(k.get('masked') for k in acc.get('keys', []))
-	]
-	if not pending:
-		return
-	scope = _reveal_scope(pending[0][0])
-	until = _keys_reveal_until.get(scope, 0)
-	if time.time() < until:
-		mins = max(1, int((until - time.time()) // 60) + 1)
-		for _, acc in pending:
-			acc['warning'] = f'站点限流中（取密钥 20 次/20 分钟/IP），约 {mins} 分钟后自动恢复'
-		return
-	if _balances_query_lock.locked():
-		rotator = None  # agentrouter 的出口轮换正在跑，切节点会互相踩 —— 退化为直连硬扛
-	else:
-		rotator = _KeysExitRotator()
-		if not await rotator.prepare():
-			rotator = None
-	switches = 0
-	via_proxy = False
-	async with _keys_reveal_lock:
-		try:
-			i = 0
-			while i < len(pending):
-				batch = pending[i:i + KEYS_REVEAL_CONCURRENCY]
-
-				async def _one(c: KeyCtx, a: dict):
-					return await reveal_key_values(c, a['keys'], request=c.proxied_request if via_proxy else None)
-
-				warnings = await asyncio.gather(*[_one(c, a) for c, a in batch])
-				for (_, acc), w in zip(batch, warnings):
-					acc['warning'] = w
-				i += len(batch)
-				for c, a in batch:
-					_keys_cache_store_if_complete(c, a)
-				for (c, a), w in zip(batch, warnings):
-					if w and '限流' in w and not c.proxied_request:
-						a['warning'] = '站点限流（取密钥 20 次/20 分钟/IP），该类账号没有可换的代理出口，请稍后再试'
-				retry = [(c, a) for (c, a), w in zip(batch, warnings) if w and '限流' in w and c.proxied_request]
-				while retry:
-					if rotator is None or switches >= KEYS_REVEAL_MAX_SWITCHES or not await rotator.next_exit():
-						_keys_reveal_until[scope] = time.time() + KEYS_REVEAL_LIMIT_WINDOW
-						for _, a in retry + pending[i:]:
-							a['warning'] = '站点限流（取密钥 20 次/20 分钟/IP）且可用出口已用尽，请 20 分钟后再试'
-						return
-					switches += 1
-					via_proxy = True
-					warnings = await asyncio.gather(*[
-						reveal_key_values(c, a['keys'], request=c.proxied_request) for c, a in retry
-					])
-					for (_, acc), w in zip(retry, warnings):
-						acc['warning'] = w
-					for c, a in retry:
-						_keys_cache_store_if_complete(c, a)
-					retry = [(c, a) for (c, a), w in zip(retry, warnings) if w and '限流' in w]
-		finally:
-			if rotator is not None:
-				await rotator.restore()
-
-
-@app.post('/api/keys/list')
-async def keys_list(req: dict):
-	"""列出若干账号的密钥（脱敏的取成全量后落缓存，之后打开/复制都零上游请求）。
-
-	refs 用前端账号卡的 `_ref` 格式，与账号类型无关；
-	refresh=True 绕过列表缓存强制重查（密钥很少变，默认走缓存，见 list_account_keys）。
-	取全量由 `_reveal_accounts` 跨账号协调 —— 限流 20 次/20 分钟/IP 是全端点共享的，
-	账号多的站点（tabitoken 29 个）必须撞限流换出口才能一轮拿完。
-	"""
-	refs = req.get('refs') or []
-	if not isinstance(refs, list) or not refs:
-		return {'success': False, 'error': '没有指定账号'}
-	refresh = bool(req.get('refresh'))
-
-	sem = asyncio.Semaphore(6)
-
-	async def _one(ref):
-		ctx, err = await resolve_key_ctx(ref)
-		if err:
-			return None, {'ref': ref, 'name': str(ref), 'provider': '', 'success': False, 'error': err}
-		async with sem:
-			return ctx, await list_account_keys(ctx, refresh, reveal=False)
-
-	pairs = list(await asyncio.gather(*[_one(r) for r in refs]))
-	await _reveal_accounts(pairs)
-	return {'success': True, 'accounts': [acc for _, acc in pairs]}
-
-
-@app.post('/api/keys/create')
-async def keys_create(req: dict):
-	"""给某个账号新建一个密钥。上游 AddToken 只回 success 不回 key，所以创建后重新列一次。"""
-	ref = req.get('ref') or ''
-	ctx, err = await resolve_key_ctx(ref)
-	if err:
-		return {'success': False, 'error': err}
-
-	name = (req.get('name') or '').strip()
-	if not name:
-		return {'success': False, 'error': '密钥名称不能为空'}
-	if len(name) > 50:
-		return {'success': False, 'error': '密钥名称不能超过 50 个字符'}
-
-	unlimited = req.get('unlimited_quota', True)
-	# 前端传的是美元，上游要的是原始额度
-	quota = req.get('remain_quota') or 0
-	body = {
-		'name': name,
-		'remain_quota': 0 if unlimited else int(float(quota) * ctx.quota_per_unit),
-		'expired_time': int(req.get('expired_time') or -1),
-		'unlimited_quota': bool(unlimited),
-		'model_limits_enabled': False,
-		'model_limits': '',
-		'allow_ips': '',
-		'group': req.get('group') or '',
-	}
-	try:
-		resp = await ctx.request('POST', TOKEN_LIST_PATH, body)
-	except Exception as e:
-		return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-	if resp.status_code != 200:
-		return {'success': False, 'error': f'HTTP {resp.status_code}'}
-	try:
-		data = resp.json()
-	except Exception:
-		return {'success': False, 'error': '响应不是 JSON（可能被拦截）'}
-	if not data.get('success'):
-		return {'success': False, 'error': data.get('message') or 'Unknown'}
-
-	return {'success': True, 'account': await list_account_keys(ctx, refresh=True)}
-
-
-@app.post('/api/keys/delete')
-async def keys_delete(req: dict):
-	"""删除某个账号下的一个密钥"""
-	ref = req.get('ref') or ''
-	key_id = req.get('id')
-	if key_id is None:
-		return {'success': False, 'error': '没有指定密钥 id'}
-	ctx, err = await resolve_key_ctx(ref)
-	if err:
-		return {'success': False, 'error': err}
-	try:
-		resp = await ctx.request('DELETE', f'{TOKEN_LIST_PATH}{key_id}')
-	except Exception as e:
-		return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-	if resp.status_code != 200:
-		return {'success': False, 'error': f'HTTP {resp.status_code}'}
-	try:
-		data = resp.json()
-	except Exception:
-		return {'success': False, 'error': '响应不是 JSON（可能被拦截）'}
-	if not data.get('success'):
-		return {'success': False, 'error': data.get('message') or 'Unknown'}
-	_key_value_cache.pop(f'{ref}:{key_id}', None)
-	_keys_list_cache.pop(f'{ref}|{ctx.name}', None)
-	return {'success': True, 'account': await list_account_keys(ctx, refresh=True)}
-
-
 @app.post('/api/monitor/start')
 async def monitor_start(req: MonitorStartRequest):
 	"""启动余额监控（accounts 为空时自动收集全部 token/站点/cookie 账号）"""
@@ -5075,270 +4521,29 @@ async def monitor_status():
 	}
 
 
-# ========== 每日用量统计 ==========
-
-# 用量数据内存缓存。record_account_usage 每记一个账号都读写一次文件，
-# 29 个账号就是 29 次全量 IO 且随历史变肥；缓存后进程内合并，落盘走写穿。
-# 按路径做 key 是为了测试里 monkeypatch USAGE_FILE 指到 tmp_path 时能正确失效。
-_usage_cache: dict | None = None
-_usage_cache_path: Path | None = None
-
-
-def load_usage_data() -> dict:
-	"""读取用量历史数据（带内存缓存；本服务是单进程独占该文件的，无外部写入方）"""
-	global _usage_cache, _usage_cache_path
-	if _usage_cache is not None and _usage_cache_path == USAGE_FILE:
-		return _usage_cache
-	_usage_cache_path = USAGE_FILE
-	if USAGE_FILE.exists():
-		try:
-			_usage_cache = json.loads(USAGE_FILE.read_text(encoding='utf-8'))
-		except Exception as e:
-			# 绝不能读失败后拿空 dict 继续跑 —— 下一次保存会把 90 天历史一次抹掉。
-			# 把坏文件留档再从空开始，历史还在备份里可人工抢救。
-			backup = USAGE_FILE.with_name(f'{USAGE_FILE.name}.corrupt-{datetime.now():%Y%m%d-%H%M%S}')
-			try:
-				os.replace(USAGE_FILE, backup)
-				print(f'[USAGE] daily_usage.json 损坏，已备份为 {backup.name} 后从空开始: {e}')
-			except OSError:
-				print(f'[USAGE] daily_usage.json 损坏且备份失败（拒绝覆盖）: {e}')
-				_usage_cache_path = None
-				raise
-			_usage_cache = {}
-	else:
-		_usage_cache = {}
-	return _usage_cache
-
-
-def save_usage_data(data: dict):
-	"""保存用量历史数据（原子写 + 同步内存缓存）"""
-	global _usage_cache, _usage_cache_path
-	_atomic_write_json(USAGE_FILE, data, indent=2)
-	_usage_cache = data
-	_usage_cache_path = USAGE_FILE
-
-
-def usage_key(provider: str, name: str) -> str:
-	"""今日用量快照的 key。
-
-	必须带站点前缀：账号名只在站点内唯一，跨站重名很常见（实测 agentrouter 与 gorouter
-	有 15 个账号同名 `2,3,5,…,18`，anyrouter 的 cookie 账号还与 gorouter 撞了 `0`/`16`）。
-	以前按裸名字存，两个站点的余额就会互相覆盖 —— 页面上 AgentRouter 显示的其实是
-	GoRouter 的数字，今日用量也跟着算错。
-	"""
-	return f'{provider}:{name}'
-
-
-def _usage_providers_by_name() -> dict[str, list[str]]:
-	"""账号名 -> 拥有该名字的站点列表，用于迁移旧数据时判断归属"""
-	owners: dict[str, list[str]] = {}
-
-	def add(provider: str, names):
-		for n in names:
-			owners.setdefault(n, [])
-			if provider not in owners[n]:
-				owners[n].append(provider)
-
-	# 顺序即歧义时的优先级：站点与 anyrouter 的余额由 0 点快照每天写入，值可信；
-	# agentrouter 只在签到时写，重名条目基本不可能是它留下的。
-	for site in load_newapi_sites():
-		add(site.id, [a.name for a in load_newapi_accounts(site)])
-	add('anyrouter', [a.name for a in load_token_accounts()])
-	add('anyrouter', [a.name for a in load_cookie_accounts()])
-	add('agentrouter', [a.name for a in load_login_accounts()])
-	return owners
-
-
-def migrate_usage_keys(usage_data: dict) -> tuple[dict, int, int]:
-	"""把裸账号名的旧条目改写成 `站点:账号名`，返回 (新数据, 迁移条数, 无法归属条数)。
-
-	归属唯一的直接改写；重名的按 `_usage_providers_by_name()` 的优先级归给第一个站点
-	（证据表明那些条目确实是 0 点快照写的），被判给谁，另一方的历史就等于从迁移当天重新开始。
-	实在找不到归属的账号（已删除的账号）原样保留，不丢数据也不乱认。
-	"""
-	owners = _usage_providers_by_name()
-	migrated = 0
-	orphaned = 0
-	out: dict = {}
-	for date, day in usage_data.items():
-		if not isinstance(day, dict):
-			out[date] = day
-			continue
-		new_day: dict = {}
-		for key, value in day.items():
-			if ':' in key:  # 已经是新格式
-				new_day[key] = value
-				continue
-			candidates = owners.get(key)
-			if not candidates:
-				new_day[key] = value  # 认不出来就别动
-				orphaned += 1
-				continue
-			new_key = usage_key(candidates[0], key)
-			# 新 key 已存在（同一天两边都写过）时不覆盖，新格式的数据更可信
-			if new_key not in new_day:
-				new_day[new_key] = value
-			migrated += 1
-		out[date] = new_day
-	return out, migrated, orphaned
-
-
-def run_usage_key_migration():
-	"""启动时跑一次 key 迁移，全是新格式则不写盘"""
-	usage_data = load_usage_data()
-	if not usage_data:
-		return
-	migrated_data, migrated, orphaned = migrate_usage_keys(usage_data)
-	if migrated == 0:
-		return
-	save_usage_data(migrated_data)
-	print(f'[USAGE] 用量 key 已迁移为「站点:账号名」：改写 {migrated} 条，无法归属 {orphaned} 条保持原样')
-
-
-def _merge_usage_entry(day: dict, key: str, used: float, quota: float):
-	"""把一个账号的余额并入某天的快照条目。key 是 `usage_key()` 生成的「站点:账号名」。
-
-	`used`/`quota` 始终是最新值（AgentRouter 的余额展示靠它）；`used0` 是当天第一次记录到的
-	已用量，也就是今日用量的基线，写入后当天不再改动 —— 签到成功时会再记一次余额，若让它
-	覆盖基线，今日用量就永远算成 0。老数据没有 used0，回退用它的 used 当基线。
-	"""
-	prev = day.get(key)
-	prev = prev if isinstance(prev, dict) else {}
-	day[key] = {
-		'used': used,
-		'quota': quota,
-		'used0': prev.get('used0', prev.get('used', used)),
-	}
-
-
-def record_account_usage(provider: str, name: str, used: float, quota: float):
-	"""把单个账号的余额写入今日用量快照（Login / 站点账号在签到时增量记录）"""
-	today = datetime.now().strftime('%Y-%m-%d')
-	usage_data = load_usage_data()
-	day = usage_data.get(today, {})
-	_merge_usage_entry(day, usage_key(provider, name), used, quota)
-	usage_data[today] = day
-	# 只保留最近 90 天
-	sorted_dates = sorted(usage_data.keys(), reverse=True)[:90]
-	usage_data = {d: usage_data[d] for d in sorted_dates}
-	save_usage_data(usage_data)
-
-
-async def take_daily_snapshot():
-	"""执行每日 0 点快照"""
-	today = datetime.now().strftime('%Y-%m-%d')
-	print(f'[USAGE] 开始执行每日快照: {today}')
-
-	# 获取 WAF cookies（仅 anyrouter 需要；失败则跳过 anyrouter 部分，gorouter 不受影响）
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies:
-		print('[USAGE] WAF cookies 获取失败，跳过 anyrouter 账号快照')
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-	all_results = []
-
-	# 1. 读取旧格式账号配置 (saved_config.json)
-	if waf_cookies and CONFIG_FILE.exists():
-		try:
-			config_data = _read_json_cached(CONFIG_FILE)
-			accounts_raw = config_data.get('accounts', [])
-			if accounts_raw:
-				accounts = [AccountItem(**acc) for acc in accounts_raw]
-
-				async def limited_query_old(acc):
-					async with sem:
-						return await query_balance(acc, waf_cookies)
-
-				tasks = [limited_query_old(acc) for acc in accounts]
-				results = await asyncio.gather(*tasks)
-				all_results.extend(('anyrouter', r) for r in results)
-				print(f'[USAGE] 旧格式账号查询完成: {len(results)} 个')
-		except Exception as e:
-			print(f'[USAGE] 读取旧格式配置失败: {e}')
-
-	# 2. 读取新格式账号配置 (new_accounts_config.json)
-	token_accounts = load_token_accounts() if waf_cookies else []
-	if token_accounts:
-
-		async def limited_query_token(acc):
-			async with sem:
-				return await query_balance_with_token(acc, waf_cookies)
-
-		tasks = [limited_query_token(acc) for acc in token_accounts]
-		results = await asyncio.gather(*tasks)
-		all_results.extend(('anyrouter', r) for r in results)
-		print(f'[USAGE] 新格式账号查询完成: {len(results)} 个')
-
-	# 注：Login（agentrouter.org）账号的余额不在此处查询。
-	# 登录接口按 IP 限流，且每日 0 点会启动签到流程，余额在每个账号签到成功时
-	# 由 record_account_usage() 增量写入今日快照，避免重复请求登录接口。
-
-	# 3. 通用 new-api 站点账号（不走 WAF/代理，各站点独立并发查询）
-	#    auto_checkin=false 的站点视为「服务器不再碰它」：不签到也不查快照（避免风控/封号）
-	for site in load_newapi_sites():
-		if not site.auto_checkin:
-			continue
-		site_accounts = load_newapi_accounts(site)
-		if not site_accounts:
-			continue
-		site_sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
-
-		async def limited_query_site(acc, s=site, sem_=site_sem):
-			async with sem_:
-				return await query_balance_newapi(s, acc)
-
-		results = await asyncio.gather(*[limited_query_site(acc) for acc in site_accounts])
-		all_results.extend((site.id, r) for r in results)
-		print(f'[USAGE] {site.label} 账号查询完成: {len(results)} 个')
-
-	if not all_results:
-		print('[USAGE] 没有账号配置，跳过快照')
-		return
-
-	# 保存快照。key 必须带站点前缀，否则跨站重名的账号会互相覆盖
-	# （anyrouter 的 cookie 账号与 gorouter 就撞了 `0`/`16`）。
-	snapshot = {usage_key(provider, r['name']): r for provider, r in all_results if r.get('success')}
-
-	if snapshot:
-		usage_data = load_usage_data()
-		# 合并而非覆盖：保留 Login 账号在签到时已增量写入的余额与当天已定下的基线
-		day = usage_data.get(today, {})
-		for key, r in snapshot.items():
-			_merge_usage_entry(day, key, r['used'], r['quota'])
-		usage_data[today] = day
-		# 只保留最近 90 天
-		sorted_dates = sorted(usage_data.keys(), reverse=True)[:90]
-		usage_data = {d: usage_data[d] for d in sorted_dates}
-		save_usage_data(usage_data)
-		print(f'[USAGE] 快照完成，记录了 {len(snapshot)} 个账号')
-	else:
-		print('[USAGE] 所有账号查询失败，未保存快照')
-
-
-def seconds_until_midnight() -> float:
-	"""计算距离下一个 0 点的秒数。
-
-	用 timedelta 跨天，不要手动 day+1 —— 那样每月最后一天必抛 ValueError，
-	会把依赖它的两个每日调度器一起带死。
-	"""
-	now = datetime.now()
-	tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-	return (tomorrow - now).total_seconds()
-
-
-async def daily_snapshot_scheduler():
-	"""每日快照调度器"""
-	while True:
-		try:
-			wait_seconds = seconds_until_midnight()
-			print(f'[USAGE] 下次快照将在 {wait_seconds:.0f} 秒后执行')
-			await asyncio.sleep(wait_seconds + 5)  # 多等 5 秒确保过了 0 点
-			await take_daily_snapshot()
-		except Exception as e:
-			print(f'[USAGE] 快照调度出错（下一轮继续）: {e}')
-			await asyncio.sleep(60)
-
-
+# ========== 每日用量统计（已迁至 server/usage.py） ==========
+# 过渡期约定同 server/keys.py：usage.py 不做模块级 import balance_server，跨实体引用
+# （USAGE_FILE、账号加载器、余额查询通道）在函数体内晚绑定 bs.<名字>，测试的
+# monkeypatch 原样生效；_usage_cache/_usage_cache_path 会被 load/save 重绑，其读写
+# 一律走 bs. 保证命名空间唯一事实来源。USAGE_FILE 常量留在本模块（测试会改写）。
+from server.usage import (  # noqa: E402
+	_usage_cache,
+	_usage_cache_path,
+	load_usage_data,
+	save_usage_data,
+	usage_key,
+	migrate_usage_keys,
+	run_usage_key_migration,
+	record_account_usage,
+	take_daily_snapshot,
+	seconds_until_midnight,
+	daily_snapshot_scheduler,
+	get_today_usage,
+	get_usage_history,
+	manual_snapshot,
+	usage_router,
+)
+app.include_router(usage_router)
 async def startup_event():
 	"""服务启动时初始化定时任务"""
 	# 先把用量快照的 key 迁移成「站点:账号名」，再判断今日有没有快照 —— 顺序反了会用旧 key 判断
@@ -5416,55 +4621,7 @@ async def startup_event():
 	print('[PATROL] 站点健康巡检调度器已启动')
 
 
-@app.get('/api/usage/today')
-async def get_today_usage():
-	"""返回今日已用量基线（daily_usage.json 当天条目的 used0），供前端算今日用量。
-
-	今日用量 = 当前 used − 今日基线，由前端拿到余额结果后即时相减得出。基线是当天第一次
-	记录到该账号时的已用量（0 点快照，或账号当天首次签到/首次入库的时刻），之后不再变动。
-
-	原先是逐账号打 /api/log/self/stat：81 个 anyrouter 账号就是 81 个上游请求，占一次
-	AnyRouter 查询总请求量的一半，且是三个并行请求里最慢的一个（14~17s）。改读本地快照后
-	此接口零上游请求、毫秒级返回，代价是数据口径从「实时」变成「以当天基线为准」。
-
-	当天还没有快照时返回空基线，前端显示 "--"。
-	"""
-	today = datetime.now().strftime('%Y-%m-%d')
-	day = load_usage_data().get(today, {})
-	baseline = {}
-	for key, v in day.items():
-		if not isinstance(v, dict):
-			continue
-		# used0 是基线；老数据没有这个字段时退回 used
-		base = v.get('used0', v.get('used'))
-		if base is not None:
-			# key 是「站点:账号名」，前端按同样的方式拼出来查
-			baseline[key] = base
-	return {
-		'success': True,
-		'date': today,
-		'baseline': baseline,
-	}
-
-
-@app.get('/api/usage/history')
-async def get_usage_history():
-	"""获取历史用量数据（最近 30 天）"""
-	usage_data = load_usage_data()
-	sorted_dates = sorted(usage_data.keys(), reverse=True)[:30]
-	history = {d: usage_data[d] for d in sorted_dates}
-	return {
-		'success': True,
-		'history': history,
-	}
-
-
-@app.post('/api/usage/snapshot')
-async def manual_snapshot():
-	"""手动触发快照（用于测试或补录）"""
-	await take_daily_snapshot()
-	return {'success': True, 'message': '快照已执行'}
-
+# 三个 /api/usage/* 端点已迁至 server/usage.py（usage_router 已在上面 include）
 
 def mask_proxy_url(url: str) -> str:
 	"""把代理 URL 里的认证凭据打码。
