@@ -1142,6 +1142,71 @@ def get_newapi_site(site_id: str) -> NewapiSite | None:
 	return None
 
 
+# ========== 站点健康自动巡检 ==========
+# 站点三态状态平时只在查询/签到时更新，死了的站点会一直挂在注册表里每天空跑
+# （实测出现过 521/522/404 的死站）。巡检调度器低频 GET /api/status（不挂中间件、
+# 1 站点 1 请求），连续 SITE_PATROL_FAIL_LIMIT 次不可达就自动暂停该站点的每日签到
+# 并推 webhook；恢复可达只更新状态，重新开启签到留给用户决定（站点可能换域名复活）。
+SITE_PATROL_INTERVAL = 6 * 3600  # 巡检间隔 6 小时
+SITE_PATROL_FIRST_DELAY = 300  # 启动 5 分钟后首巡（避开启动高峰）
+SITE_PATROL_FAIL_LIMIT = 3
+site_patrol_fails: dict[str, int] = {}
+
+
+async def run_site_patrol() -> None:
+	"""巡检一轮全部站点，更新三态状态并在持续失联时自动暂停签到"""
+	sites = load_newapi_sites()
+	if not sites:
+		return
+	for s in sites:
+		try:
+			resp = await newapi_request(s, 'GET', s.status_path, {'User-Agent': USER_AGENT})
+			ok = resp.status_code == 200
+			if ok:
+				try:
+					ok = bool((resp.json() or {}).get('data', {}).get('version'))
+				except Exception:
+					ok = False
+		except Exception:
+			ok = False
+
+		if ok:
+			if site_patrol_fails.get(s.id, 0) >= SITE_PATROL_FAIL_LIMIT:
+				add_newapi_checkin_log(s, '巡检：站点恢复可达（每日签到仍为暂停，请手动重新开启）')
+			site_patrol_fails[s.id] = 0
+			if _site_status.get(s.id, {}).get('status') == 'invalid':
+				_set_site_status(s.id, 'unknown', '')
+			continue
+
+		n = site_patrol_fails.get(s.id, 0) + 1
+		site_patrol_fails[s.id] = n
+		if n >= SITE_PATROL_FAIL_LIMIT and s.auto_checkin:
+			current = load_newapi_sites()
+			for s2 in current:
+				if s2.id == s.id:
+					s2.auto_checkin = False
+			save_newapi_sites(current)
+			msg = f'巡检：连续 {n} 次不可达，已自动暂停每日签到'
+			add_newapi_checkin_log(s, msg)
+			_set_site_status(s.id, 'invalid', f'巡检连续 {n} 次不可达')
+			if notify_configured():
+				_spawn(send_webhook_notify(
+					f'⚠️ {s.label} 已失联',
+					f'{s.domain} 连续 {n} 次巡检不可达，已自动暂停每日签到。\n站点恢复后请在站点管理重新开启自动签到。',
+				))
+
+
+async def site_patrol_scheduler():
+	"""低频巡检调度器：先等首巡延迟，然后每 6 小时一轮"""
+	await asyncio.sleep(SITE_PATROL_FIRST_DELAY)
+	while True:
+		try:
+			await run_site_patrol()
+		except Exception as e:
+			print(f'[PATROL] 巡检异常: {e}')
+		await asyncio.sleep(SITE_PATROL_INTERVAL)
+
+
 def load_newapi_accounts(site: NewapiSite) -> list[NewapiAccountItem]:
 	"""从站点自己的 accounts_file 加载账号列表"""
 	return _read_json_models(site.accounts_path(), NewapiAccountItem, site.id.upper())
@@ -1177,8 +1242,8 @@ async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict
 	"""
 	url = site.domain + path
 	prot = protection_cache.get(site.domain.rstrip('/'))
-	if prot and prot['expires'] <= time.time():
-		prot = None
+	if prot and (prot.get('failed') or prot['expires'] <= time.time()):
+		prot = None  # 负缓存/过期条目对请求方不可见；负缓存的拦截图在 ensure 里做
 	send_headers = dict(headers)
 	if prot and prot.get('user_agent'):
 		send_headers['User-Agent'] = prot['user_agent']
@@ -1329,16 +1394,24 @@ def get_turnstile_solver_config() -> dict:
 async def solve_turnstile_token(site_key: str, page_url: str, timeout: int = TURNSTILE_SOLVER_TIMEOUT) -> dict:
 	"""调打码平台解一个 Turnstile token，成功返回 {'success': True, 'token': ...}。
 
-	同一 token 只能用一次（new-api 转发给 CF siteverify 后即作废），每个账号签到前
-	各解一个。CapSolver 的 createTask 可能直接带 solution.token，与轮询 getTaskResult
-	两种返回方式一并兼容。
+	对外入口：先做不触网的预检（未配置/缺 sitekey 不计费用统计），再交给 _raw 实际
+	求解并按结果更新当日用量计数（solved / failed，落盘跨重启）。
 	"""
 	cfg = get_turnstile_solver_config()
 	if not (cfg['api_key'] and cfg['base_url'] and cfg['task_type']):
 		return {'success': False, 'error': '打码平台未配置（设置页选择平台并填 api_key）'}
 	if not site_key:
 		return {'success': False, 'error': '缺少 sitekey（站点状态探测失败）'}
+	r = await _solve_turnstile_token_raw(cfg, site_key, page_url, timeout)
+	_solver_stats_bump(bool(r.get('success')))
+	return r
 
+
+async def _solve_turnstile_token_raw(cfg: dict, site_key: str, page_url: str, timeout: int) -> dict:
+	"""实际调打码平台。同一 token 只能用一次（new-api 转发给 CF siteverify 后即作废），
+	每个账号签到前各解一个。CapSolver 的 createTask 可能直接带 solution.token，
+	与轮询 getTaskResult 两种返回方式一并兼容。
+	"""
 	def _post(path: str, payload: dict):
 		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
 		return sess.post(cfg['base_url'] + path, json=payload, timeout=30)
@@ -1487,19 +1560,29 @@ async def solve_cf_challenge(domain: str) -> dict | None:
 
 
 async def ensure_protection_cookies(site: NewapiSite, kind: str) -> dict | None:
-	"""确保某站点的防护 cookies 就绪（5 分钟缓存 + 按域名 singleflight），失败返回 None。
+	"""确保某站点的防护 cookies 就绪（成功缓存 5 分钟，失败负缓存 60 秒），失败返回 None。
 
 	singleflight 很重要：签到是 10 并发，缓存过期瞬间不能让每个账号各打一次
 	FlareSolverr/WAF 挑战页（前者按次耗时几十秒，后者可能撞 IP 限流）。
+	失败也记一段短负缓存：FlareSolverr 挂掉时一批 10 个账号不至各自等满 70 秒超时，
+	60 秒后自动允许重试，不影响「服务恢复即恢复签到」。
 	"""
 	domain = site.domain.rstrip('/')
 	cached = protection_cache.get(domain)
+	if cached and cached.get('failed'):
+		# 负缓存：近期刚失败过，别再去撞求解器
+		if cached['expires'] > time.time():
+			return None
+		protection_cache.pop(domain, None)
+		cached = None
 	if cached and cached['expires'] > time.time():
 		return cached
 	lock = _protection_locks.setdefault(domain, asyncio.Lock())
 	async with lock:
 		cached = protection_cache.get(domain)
-		if cached and cached['expires'] > time.time():
+		if cached and cached.get('failed') and cached['expires'] > time.time():
+			return None
+		if cached and not cached.get('failed') and cached['expires'] > time.time():
 			return cached
 		if kind == 'aliyun_waf':
 			solved = await solve_aliyun_waf(domain)
@@ -1508,6 +1591,7 @@ async def ensure_protection_cookies(site: NewapiSite, kind: str) -> dict | None:
 		else:
 			solved = None
 		if not solved:
+			protection_cache[domain] = {'failed': True, 'expires': time.time() + 60}
 			return None
 		entry = {**solved, 'expires': time.time() + WAF_CACHE_TTL}
 		protection_cache[domain] = entry
@@ -1533,6 +1617,219 @@ async def probe_page_protection(domain: str) -> dict:
 		}
 	except Exception as e:
 		return {'http_status': None, 'cf_challenge': False, 'aliyun_waf': False, 'error': str(e)[:100]}
+
+
+# ========== Webhook 通知（Telegram / Server酱 / Bark / 通用）==========
+# 邮件之外的第二条告警通道。配置存 saved_config.json 的 notify 段（该文件已在
+# gitignore 里且仅服务端持有，webhook URL 里的 bot token 与账号 token 同级敏感）。
+# 三家的差异只在请求形状，这里抹平成统一的 (title, body) 入口。
+
+def get_notify_config() -> dict:
+	"""读通知配置；未配置时返回 on_alert=True / on_checkin_failed=False 的默认值。"""
+	try:
+		cfg = _read_json_cached(CONFIG_FILE)
+	except Exception:
+		cfg = {}
+	n = cfg.get('notify') if isinstance(cfg, dict) else None
+	n = n if isinstance(n, dict) else {}
+	return {
+		'type': (n.get('type') or '').strip().lower(),
+		'url': (n.get('url') or '').strip(),
+		'chat_id': (n.get('chat_id') or '').strip(),
+		'on_alert': bool(n.get('on_alert', True)),
+		'on_checkin_failed': bool(n.get('on_checkin_failed', False)),
+	}
+
+
+def notify_configured() -> bool:
+	n = get_notify_config()
+	return bool(n['url']) and n['type'] in ('telegram', 'serverchan', 'bark', 'generic')
+
+
+async def send_webhook_notify(title: str, body: str) -> dict:
+	"""按配置发一条通知，返回 {sent: bool, error?}。未配置/发送失败都不抛异常。
+
+	Telegram 用 sendMessage（URL 含 bot token，chat_id 单独存）；Server酱是
+	KEY.send 表单；Bark 是 <key>/push 的 JSON；通用网关 POST {title, message}。
+	"""
+	n = get_notify_config()
+	if not notify_configured():
+		return {'sent': False, 'error': '通知未配置'}
+
+	# 各渠道请求形状不同：Telegram/通用收 JSON，Server酱只认表单编码，
+	# Bark 官方形式是 POST {origin}/push 且 device_key 放 body
+	form_data = None
+	if n['type'] == 'telegram':
+		url = n['url']
+		payload = {'chat_id': n['chat_id'], 'text': f'{title}\n\n{body}'}
+	elif n['type'] == 'serverchan':
+		url = n['url'] if n['url'].endswith('.send') else n['url'].rstrip('/') + '.send'
+		payload = {'title': title, 'desp': body}
+		form_data = payload
+	elif n['type'] == 'bark':
+		parsed = urlparse(n['url'])
+		device_key = parsed.path.rstrip('/').rpartition('/')[2]
+		if not device_key:
+			return {'sent': False, 'error': 'Bark URL 里没有 device key（应为 https://api.day.app/<key>）'}
+		url = f'{parsed.scheme}://{parsed.netloc}/push'
+		payload = {'device_key': device_key, 'title': title, 'body': body, 'group': 'newapi-checkin'}
+	else:
+		url = n['url']
+		payload = {'title': title, 'message': body}
+
+	def _do():
+		sess = _get_cffi_session('notify')
+		if form_data is not None:
+			return sess.post(url, data=form_data, timeout=15)
+		return sess.post(url, json=payload, timeout=15)
+
+	loop = asyncio.get_running_loop()
+	try:
+		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do)
+		if resp.status_code != 200:
+			return {'sent': False, 'error': f'HTTP {resp.status_code}'}
+		return {'sent': True}
+	except Exception as e:
+		return {'sent': False, 'error': f'{type(e).__name__}: {e}'[:120]}
+
+
+def _mask_secret(value: str) -> str:
+	"""URL 里通常嵌着 bot token / sendkey，API 回显只露首尾（短 key 最多露 8 字符）。"""
+	if len(value) <= 40:
+		return value[:8] + '…' if value else ''
+	return value[:28] + '…' + value[-8:]
+
+
+# ── 打码用量统计：按天计数（次数 = 费用），跨重启持久化到 solver_stats.json ──
+SOLVER_STATS_FILE = Path(__file__).parent / 'solver_stats.json'
+
+
+def _solver_stats() -> dict:
+	today = datetime.now().strftime('%Y-%m-%d')
+	try:
+		data = json.loads(SOLVER_STATS_FILE.read_text(encoding='utf-8'))
+	except Exception:
+		data = {}
+	if not isinstance(data, dict) or data.get('date') != today:
+		data = {'date': today, 'solved': 0, 'failed': 0}
+	return data
+
+
+def _solver_stats_bump(ok: bool) -> None:
+	try:
+		data = _solver_stats()
+		data['solved' if ok else 'failed'] = data.get('solved' if ok else 'failed', 0) + 1
+		_atomic_write_json(SOLVER_STATS_FILE, data)
+	except Exception as e:
+		print(f'[SOLVER] 用量统计写入失败: {e}')
+
+
+@app.get('/api/turnstile/solver/stats')
+async def solver_stats():
+	"""今日打码用量（成功/失败次数，失败也消耗平台侧部分配额）"""
+	return {'success': True, 'stats': _solver_stats()}
+
+
+@app.post('/api/turnstile/solver/balance')
+async def solver_balance():
+	"""查询打码平台账户余额（按次查询，前端按钮触发，不自动轮询）。
+
+	2Captcha 用 res.php?action=getbalance，YesCaptcha/CapSolver/自定义网关走
+	createTask 同族的 POST /getBalance {clientKey}。
+	"""
+	cfg = get_turnstile_solver_config()
+	if not cfg['api_key']:
+		return {'success': False, 'error': '打码平台未配置'}
+
+	def _do_2captcha():
+		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
+		return sess.get(f'{cfg["base_url"]}/res.php', params={'key': cfg['api_key'], 'action': 'getbalance', 'json': 1}, timeout=15)
+
+	def _do_getbalance():
+		sess = _get_cffi_session(f'turnstile-solver:{cfg["base_url"]}')
+		return sess.post(cfg['base_url'] + '/getBalance', json={'clientKey': cfg['api_key']}, timeout=15)
+
+	loop = asyncio.get_running_loop()
+	try:
+		if cfg['provider'] == '2captcha':
+			data = (await loop.run_in_executor(_UPSTREAM_POOL, _do_2captcha)).json()
+			# {"status":1,"request":"9.12"} 或 {"status":0,"request":"ERROR_..."}
+			if str(data.get('status')) == '1':
+				return {'success': True, 'balance': float(data.get('request', 0))}
+			return {'success': False, 'error': str(data.get('request'))[:100]}
+		resp = await loop.run_in_executor(_UPSTREAM_POOL, _do_getbalance)
+		data = resp.json()
+		if data.get('errorId'):
+			return {'success': False, 'error': str(data.get('errorCode') or data.get('errorDescription'))[:100]}
+		if data.get('balance') is not None:
+			return {'success': True, 'balance': float(data['balance'])}
+		return {'success': False, 'error': f'响应异常: {str(data)[:100]}'}
+	except Exception as e:
+		return {'success': False, 'error': f'{type(e).__name__}: {e}'[:120]}
+
+
+@app.get('/api/notify')
+async def get_notify():
+	"""通知配置状态，URL 打码回显"""
+	n = get_notify_config()
+	return {
+		'success': True,
+		'notify': {
+			'type': n['type'],
+			'chat_id': n['chat_id'],
+			'url_masked': _mask_secret(n['url']) if n['url'] else '',
+			'configured': notify_configured(),
+			'on_alert': n['on_alert'],
+			'on_checkin_failed': n['on_checkin_failed'],
+		},
+	}
+
+
+class NotifyRequest(BaseModel):
+	"""通知配置。url 留空表示保留已保存的值（URL 含 token，不回显也就无法重传）。"""
+
+	type: str
+	url: str = ''
+	chat_id: str = ''
+	on_alert: bool = True
+	on_checkin_failed: bool = False
+
+
+@app.post('/api/notify')
+async def save_notify(req: NotifyRequest):
+	"""保存通知配置（合并写 saved_config.json，不动其他段）"""
+	ntype = req.type.strip().lower()
+	if ntype not in ('telegram', 'serverchan', 'bark', 'generic'):
+		return {'success': False, 'error': f'未知通知类型: {req.type}（可选 telegram / serverchan / bark / generic）'}
+	try:
+		data = dict(_read_json_cached(CONFIG_FILE) or {}) if CONFIG_FILE.exists() else {}
+	except Exception:
+		data = {}
+	saved = data.get('notify') or {}
+	# 换渠道必须重填 URL：不同渠道的 URL 格式互不兼容（Telegram 带路径 token、
+	# Server酱是 KEY.send、Bark 是 device key），沿用旧 URL 只会得到必然失败的配置
+	if not req.url.strip() and saved.get('url') and (saved.get('type') or ntype) != ntype:
+		return {'success': False, 'error': f'从 {saved.get("type")} 切换到 {ntype} 需要重新填写新渠道的 URL'}
+	data['notify'] = {
+		'type': ntype,
+		'url': req.url.strip() or saved.get('url') or '',
+		'chat_id': req.chat_id.strip(),
+		'on_alert': req.on_alert,
+		'on_checkin_failed': req.on_checkin_failed,
+	}
+	_atomic_write_json(CONFIG_FILE, data, indent=2)
+	return {'success': True, 'message': '通知配置已保存'}
+
+
+@app.post('/api/notify/test')
+async def test_notify():
+	"""发一条测试通知验证配置"""
+	if not notify_configured():
+		return {'success': False, 'error': '请先保存完整配置（类型 + URL）'}
+	r = await send_webhook_notify('✅ 测试通知', 'newapi-checkin 通知通道配置成功，这是一条测试消息。')
+	if r['sent']:
+		return {'success': True, 'message': '测试通知已发送'}
+	return {'success': False, 'error': r.get('error', '发送失败')}
 
 
 async def sign_in_newapi(site: NewapiSite, account: NewapiAccountItem, turnstile_token: str | None = None) -> dict:
@@ -2058,6 +2355,16 @@ async def run_newapi_checkin(site: NewapiSite, trigger: str = 'manual'):
 			site, f'{site.label} 签到结束：成功 {st["signed"]} · 今日已签 {st["already"]} · 失败 {st["failed"]}'
 		)
 		save_newapi_checkin_state(site)
+		# 失败推 webhook（默认关，设置页可开）——失败只在日志里等用户翻页发现不了
+		if st['failed'] > 0 and notify_configured() and get_notify_config()['on_checkin_failed']:
+			bad = [f'{name}：{v["message"][:60]}' for name, v in st['accounts'].items() if v['status'] == 'failed']
+
+			async def _push_failure():
+				r = await send_webhook_notify(f'❌ {site.label} 签到失败 {st["failed"]} 个', '\n'.join(bad))
+				if not r.get('sent'):
+					add_newapi_checkin_log(site, f'失败通知推送未发送：{r.get("error", "")}')
+
+			_spawn(_push_failure())
 
 	if not accounts:
 		add_newapi_checkin_log(site, f'没有 {site.label} 账号，签到结束')
@@ -2423,6 +2730,11 @@ async def monitor_loop(config: MonitorStartRequest, accounts: list[dict]):
 						add_monitor_log(f'邮件发送失败：{str(e)[:80]}')
 				else:
 					add_monitor_log('所有账号余额正常')
+
+				# webhook 通知独立于邮件：配置了就走，两者可并存（未配置不记日志，免噪音）
+				if low_balance and notify_configured() and get_notify_config()['on_alert']:
+					wr = await send_webhook_notify(subject, body)
+					add_monitor_log(f'webhook 通知：{"已发送" if wr["sent"] else "未发送（" + wr.get("error", "") + "）"}')
 			except Exception as e:
 				add_monitor_log(f'检测出错：{str(e)[:80]}')
 
@@ -3852,6 +4164,7 @@ async def turnstile_solver_status():
 			'configured': bool(cfg['api_key'] and cfg['base_url'] and cfg['task_type']),
 			'flaresolverr_url': get_flaresolverr_url(),
 			'presets': {name: p['base_url'] for name, p in TURNSTILE_SOLVER_PRESETS.items()},
+			'stats': _solver_stats(),
 		},
 	}
 
@@ -5097,6 +5410,10 @@ async def startup_event():
 			if load_newapi_accounts(site):
 				print(f'[{site.id.upper()}] 今日 ({today}) 签到未完成，启动时补签一轮')
 				start_newapi_checkin(site, trigger='auto')
+
+	# 站点健康自动巡检（6 小时一轮，连续 3 次不可达自动暂停该站签到并推通知）
+	_spawn(site_patrol_scheduler())
+	print('[PATROL] 站点健康巡检调度器已启动')
 
 
 @app.get('/api/usage/today')

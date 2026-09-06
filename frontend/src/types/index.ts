@@ -135,6 +135,8 @@ export interface TurnstileSolverStatus {
   flaresolverr_url: string;
   /** 各预设平台的默认 API 域名（custom 平台不在此列） */
   presets: Record<string, string>;
+  /** 今日打码用量（次数 ≈ 费用） */
+  stats: { date: string; solved: number; failed: number };
 }
 
 export interface TurnstileSolverSaveResponse {
@@ -165,6 +167,39 @@ export interface ProtectionTestResponse {
   protections: { cf_challenge: boolean; aliyun_waf: boolean; turnstile: boolean };
   solved: { aliyun_waf?: boolean; cf_challenge?: boolean | null };
   flaresolverr_configured: boolean;
+  error?: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Webhook 通知：GET/POST /api/notify、POST /api/notify/test
+// ─────────────────────────────────────────────────────────────────────────
+
+/** GET /api/notify —— URL 含 bot token/sendkey，只回打码后的形态 */
+export interface NotifyStatus {
+  type: string;
+  chat_id: string;
+  url_masked: string;
+  configured: boolean;
+  on_alert: boolean;
+  on_checkin_failed: boolean;
+}
+
+export interface NotifySaveResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
+export interface NotifyTestResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
+/** POST /api/turnstile/solver/balance —— 打码平台账户余额 */
+export interface SolverBalanceResponse {
+  success: boolean;
+  balance?: number;
   error?: string;
 }
 

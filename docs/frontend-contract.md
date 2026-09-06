@@ -85,7 +85,15 @@
 - `newapi_request` 撞上 CF 边缘质询（cf-mitigated: challenge）或阿里云 WAF 挑战页（arg1）时，自动解防护 cookies（按域名缓存 5 分钟 + singleflight）原地重打一次；CF 质询需在设置页配 FlareSolverr（`request.get` 协议，必须与本服务同出口 IP，cf_clearance 绑 UA）。
 - `/api/sites/probe` 的 info 现在带 `protections{cf_challenge,aliyun_waf}`（首页裸探测，保守分类）。
 
-### 密钥管理
+### Webhook 通知与打码可观测性
+
+| GET `/api/notify` | 1761 | 通知配置状态（URL 打码回显） | — | `{success,notify{type,chat_id,url_masked,configured,on_alert,on_checkin_failed}}` | ✅ |
+| POST `/api/notify` | 1788 | 保存通知配置（telegram/serverchan/bark/generic；url 留空保留旧值） | `{type,url?,chat_id?,on_alert,on_checkin_failed}` | `{success,message?/error?}` | ✅ |
+| POST `/api/notify/test` | 1810 | 发一条测试通知 | — | `{success,message?/error?}` | ✅ |
+| GET `/api/turnstile/solver/stats` | 1717 | 今日打码用量（跨重启持久化） | — | `{success,stats{date,solved,failed}}` | ✅ |
+| POST `/api/turnstile/solver/balance` | 1723 | 查打码平台账户余额（按需触发；2captcha 走 res.php，其余走 /getBalance） | — | `{success,balance?/error?}` | ✅ |
+
+挂钩：监控告警（`on_alert`）与站点签到失败（`on_checkin_failed`）自动推 webhook；站点巡检连续 3 次不可达自动暂停该站 auto_checkin 并推通知（`run_site_patrol`，6 小时一轮）。
 
 | POST `/api/keys/list` | 3826 | 批量列出/补取全量密钥 | `{refs:[...],refresh?}` | `{success,accounts:[{ref,name,provider,success,keys,total,truncated,warning?,cached?}]}` | ✅ |
 | POST `/api/keys/create` | 3854 | 建密钥 | `{ref,name,unlimited_quota?,remain_quota?,expired_time?,group?}` | `{success,account}` | ✅ |

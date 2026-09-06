@@ -15,7 +15,7 @@ import { apiGet, apiPost } from "@/shared/api/client";
 import type { CookieAccount, MonitorEmailConfig, MonitorStatus, SavedConfig } from "@/types";
 
 import { errorMessage } from "@/features/checkin/checkin-format";
-import { getTurnstileSolver, saveTurnstileSolver, testSiteProtection, testTurnstileSolver } from "@/features/checkin/checkin-api";
+import { getNotify, saveNotify, testNotify, getSolverBalance, getTurnstileSolver, saveTurnstileSolver, testSiteProtection, testTurnstileSolver } from "@/features/checkin/checkin-api";
 
 /** GET /api/monitor/status 是全项目唯一不带 {success:...} 信封的端点——apiGet 原样透传整个 payload */
 interface ProxyInfo {
@@ -140,6 +140,146 @@ const SOLVER_LABELS: Record<string, string> = {
   custom: "自定义网关",
 };
 
+const NOTIFY_LABELS: Record<string, string> = {
+  telegram: "Telegram Bot",
+  serverchan: "Server酱",
+  bark: "Bark",
+  generic: "通用 Webhook",
+};
+
+/**
+ * Webhook 通知渠道配置。URL 里嵌着 bot token / sendkey，后端只回打码形态，
+ * 表单留空即保持原值。「发送测试」会真发一条消息。
+ */
+function NotifySection() {
+  const queryClient = useQueryClient();
+  const notifyQ = useQuery({ queryKey: ["notify"], queryFn: getNotify });
+  const notify = notifyQ.data?.notify;
+  const [type, setType] = useState<string>("");
+  const [url, setUrl] = useState("");
+  const [chatId, setChatId] = useState("");
+  const [onAlert, setOnAlert] = useState(true);
+  const [onCheckinFailed, setOnCheckinFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+
+  const effectiveType = type || notify?.type || "telegram";
+  const urlPlaceholder =
+    effectiveType === "telegram"
+      ? "https://api.telegram.org/bot<TOKEN>/sendMessage"
+      : effectiveType === "serverchan"
+        ? "https://sctapi.ftqq.com/<SENDKEY>"
+        : effectiveType === "bark"
+          ? "https://api.day.app/<DEVICE_KEY>"
+          : "https://your-gateway.example.com/hook";
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const r = await saveNotify({ type: effectiveType, url, chat_id: chatId, on_alert: onAlert, on_checkin_failed: onCheckinFailed });
+      if (!r.success) {
+        toast.error(r.error ?? "保存失败");
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ["notify"] });
+      setUrl("");
+      toast.success(r.message ?? "已保存");
+    } catch (err) {
+      toast.error(errorMessage(err, "保存失败"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleTest() {
+    setTesting(true);
+    try {
+      const r = await testNotify();
+      if (r.success) toast.success(r.message ?? "测试通知已发送");
+      else toast.error(r.error ?? "发送失败");
+    } catch (err) {
+      toast.error(errorMessage(err, "测试失败"));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <section className="rounded-lg bg-card p-4 sm:p-5">
+      <div className="flex min-h-8 items-center justify-between gap-3">
+        <h2 className="text-sm font-medium">通知渠道</h2>
+        {notifyQ.isLoading ? null : notify?.configured ? (
+          <Badge variant="secondary" className="text-[11px] text-checkin-done">
+            {NOTIFY_LABELS[notify.type] ?? notify.type} 已配置
+          </Badge>
+        ) : (
+          <Badge variant="secondary" className="text-[11px] text-muted-foreground">未配置</Badge>
+        )}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        余额告警与签到失败可通过 webhook 推送（与邮件告警相互独立）。URL 里含 token，保存后仅显示打码形态，留空表示不变。
+      </p>
+      {notifyQ.isPending ? (
+        <LoadingState className="min-h-20" />
+      ) : notifyQ.isError ? (
+        <ErrorState message={errorMessage(notifyQ.error, "通知配置加载失败")} onRetry={() => void notifyQ.refetch()} />
+      ) : (
+        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="space-y-1">
+            <Label htmlFor="notify-type" className="text-xs">渠道</Label>
+            <Select value={effectiveType} onValueChange={setType}>
+              <SelectTrigger id="notify-type" className="h-8 text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {Object.keys(NOTIFY_LABELS).map((t) => (
+                  <SelectItem key={t} value={t}>{NOTIFY_LABELS[t]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="notify-url" className="text-xs">Webhook URL</Label>
+            <Input
+              id="notify-url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              className="h-8 font-data text-xs"
+              placeholder={notify?.url_masked || urlPlaceholder}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="notify-chat-id" className="text-xs">Chat ID（仅 Telegram 需要）</Label>
+            <Input
+              id="notify-chat-id"
+              value={chatId}
+              onChange={(e) => setChatId(e.target.value)}
+              className="h-8 font-data text-xs"
+              placeholder={notify?.chat_id || "123456789"}
+            />
+          </div>
+          <div className="flex items-end">
+            <Button onClick={() => void handleSave()} disabled={saving}>
+              {saving ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Send className="size-3.5" aria-hidden="true" />}
+              保存
+            </Button>
+            <Button variant="secondary" className="ml-2" onClick={() => void handleTest()} disabled={testing}>
+              {testing ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <FlaskConical className="size-3.5" aria-hidden="true" />}
+              发送测试
+            </Button>
+          </div>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <input type="checkbox" checked={onAlert} onChange={(e) => setOnAlert(e.target.checked)} className="size-3.5 accent-current" />
+            余额告警时推送
+          </label>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <input type="checkbox" checked={onCheckinFailed} onChange={(e) => setOnCheckinFailed(e.target.checked)} className="size-3.5 accent-current" />
+            签到失败时推送
+          </label>
+        </div>
+      )}
+    </section>
+  );
+}
+
 /**
  * 人机校验与防护配置：打码平台（过 Turnstile）+ FlareSolverr（过 CF 边缘质询）。
  * api_key 后端不回显（只回 configured），表单留空即保持原值。
@@ -158,10 +298,26 @@ function SolverSection() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [probing, setProbing] = useState(false);
+  const [balance, setBalance] = useState<string | null>(null);
+  const [loadingBalance, setLoadingBalance] = useState(false);
 
   const effectiveProvider = provider || solver?.provider || "2captcha";
   const presetUrl = solver?.presets?.[effectiveProvider];
   const effectiveFlare = flaresolverrUrl ?? solver?.flaresolverr_url ?? "";
+  const stats = solver?.stats;
+
+  async function handleBalance() {
+    setLoadingBalance(true);
+    try {
+      const r = await getSolverBalance();
+      if (r.success) setBalance(`$${(r.balance ?? 0).toFixed(2)}`);
+      else toast.error(r.error ?? "余额查询失败");
+    } catch (err) {
+      toast.error(errorMessage(err, "余额查询失败"));
+    } finally {
+      setLoadingBalance(false);
+    }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -219,13 +375,25 @@ function SolverSection() {
     <section className="rounded-lg bg-card p-4 sm:p-5">
       <div className="flex min-h-8 items-center justify-between gap-3">
         <h2 className="text-sm font-medium">人机校验与防护</h2>
-        {solverQ.isLoading ? null : solver?.configured ? (
-          <Badge variant="secondary" className="text-[11px] text-checkin-done">
-            {SOLVER_LABELS[solver.provider] ?? solver.provider} 已配置
-          </Badge>
-        ) : (
-          <Badge variant="secondary" className="text-[11px] text-muted-foreground">未配置</Badge>
-        )}
+        <div className="flex items-center gap-2">
+          {solver?.configured && stats ? (
+            <span className="text-[11px] text-muted-foreground">
+              今日打码 {stats.solved} 次{stats.failed > 0 ? ` · 失败 ${stats.failed}` : ""}
+            </span>
+          ) : null}
+          {balance ? <Badge variant="secondary" className="font-data text-[11px]">{balance}</Badge> : null}
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-[11px] text-muted-foreground" onClick={() => void handleBalance()} disabled={loadingBalance}>
+            {loadingBalance ? <Loader2 className="size-3 animate-spin" aria-hidden="true" /> : null}
+            查余额
+          </Button>
+          {solverQ.isLoading ? null : solver?.configured ? (
+            <Badge variant="secondary" className="text-[11px] text-checkin-done">
+              {SOLVER_LABELS[solver.provider] ?? solver.provider} 已配置
+            </Badge>
+          ) : (
+            <Badge variant="secondary" className="text-[11px] text-muted-foreground">未配置</Badge>
+          )}
+        </div>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
         配置后，开启 Cloudflare Turnstile 人机校验的站点也能在服务器端自动签到（含每天 0 点的自动任务），按求解次数计费。
@@ -424,6 +592,8 @@ export function SettingsPage() {
       </section>
 
       <SolverSection />
+
+      <NotifySection />
 
       <section className="rounded-lg bg-card p-4 sm:p-5">
         <div className="flex min-h-8 items-center justify-between gap-3">

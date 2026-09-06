@@ -233,14 +233,32 @@ def test_ensure_并发只解一次且结果进缓存(monkeypatch):
 	assert bs.protection_cache['https://t.com']['cookies'] == {'cf_clearance': 'cb'}
 
 
-def test_ensure_求解失败不进缓存(monkeypatch):
+def test_ensure_求解失败写负缓存且60秒内不再撞(monkeypatch):
+	calls = {'n': 0}
+
 	async def fail_solve(domain):
+		calls['n'] += 1
 		return None
 
 	monkeypatch.setattr(bs, 'solve_aliyun_waf', fail_solve)
 	s = site()
 	assert asyncio.run(bs.ensure_protection_cookies(s, 'aliyun_waf')) is None
-	assert bs.protection_cache == {}
+	assert asyncio.run(bs.ensure_protection_cookies(s, 'aliyun_waf')) is None
+	assert calls['n'] == 1, '负缓存生效：连续失败只真正求解一次'
+	assert bs.protection_cache['https://t.com']['failed'] is True
+	# 过期后允许重试
+	bs.protection_cache['https://t.com']['expires'] = time.time() - 1
+	assert asyncio.run(bs.ensure_protection_cookies(s, 'aliyun_waf')) is None
+	assert calls['n'] == 2
+
+
+def test_请求_负缓存对请求方不可见(env):
+	# newapi_request 读到负缓存条目时必须跳过（无 cookies 键），照常发请求
+	env.site_script.append(FakeResp(200, payload={'success': True}))
+	bs.protection_cache['https://t.com'] = {'failed': True, 'expires': time.time() + 60}
+	r = asyncio.run(bs.newapi_request(site(), 'GET', '/api/status', {}))
+	assert r.status_code == 200
+	assert len(env.site_sessions) == 1
 
 
 # ===== newapi_request 自动过验 =====
@@ -379,3 +397,105 @@ def test_protection_test_撞质询未配flaresolverr时报None(env, config_file,
 
 	r = asyncio.run(bs.protection_test())
 	assert r['solved'] == {'cf_challenge': None}, 'None = 撞到了但没配求解器'
+
+
+# ===== 站点健康自动巡检 =====
+
+
+def test_巡检_连续失败自动暂停签到并推通知(monkeypatch, tmp_path):
+	# 注册表与状态文件隔离
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'sites.json')
+	monkeypatch.setattr(bs, '_SITE_STATUS_FILE', tmp_path / 'site_status.json')
+	bs._site_status.clear()
+	s = site()
+	(tmp_path / 'sites.json').write_text(json.dumps([{'id': 't', 'label': 'T', 'domain': 'https://t.com', 'auto_checkin': True}]), encoding='utf-8')
+	monkeypatch.setattr(bs, 'site_patrol_fails', {})
+	notified = []
+
+	async def fail_req(s2, method, path, headers, json_body=None, _auto_bypass=True):
+		return FakeResp(521, body='origin down', headers={})
+
+	async def fake_notify(title, body):
+		notified.append(title)
+		return {'sent': True}
+
+	monkeypatch.setattr(bs, 'newapi_request', fail_req)
+	monkeypatch.setattr(bs, 'notify_configured', lambda: True)
+	monkeypatch.setattr(bs, 'send_webhook_notify', fake_notify)
+
+	async def run_three():
+		for _ in range(bs.SITE_PATROL_FAIL_LIMIT):
+			await bs.run_site_patrol()
+
+	asyncio.run(run_three())
+	assert notified, '自动暂停时应推 webhook'
+	assert '失联' in notified[0]
+	# 注册表里的 auto_checkin 已被写回 False
+	saved = json.loads((tmp_path / 'sites.json').read_text(encoding='utf-8'))
+	assert saved[0]['auto_checkin'] is False
+	# 三态状态标记为 invalid
+	assert bs._site_status['t']['status'] == 'invalid'
+
+
+def test_巡检_失败未达阈值不暂停(monkeypatch, tmp_path):
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'sites.json')
+	monkeypatch.setattr(bs, '_SITE_STATUS_FILE', tmp_path / 'site_status.json')
+	bs._site_status.clear()
+	(tmp_path / 'sites.json').write_text(json.dumps([{'id': 't', 'label': 'T', 'domain': 'https://t.com', 'auto_checkin': True}]), encoding='utf-8')
+	monkeypatch.setattr(bs, 'site_patrol_fails', {})
+	notified = []
+
+	async def fail_req(s2, method, path, headers, json_body=None, _auto_bypass=True):
+		return FakeResp(500, body='', headers={})
+
+	async def fake_notify(title, body):
+		notified.append(title)
+		return {'sent': True}
+
+	monkeypatch.setattr(bs, 'newapi_request', fail_req)
+	monkeypatch.setattr(bs, 'notify_configured', lambda: True)
+	monkeypatch.setattr(bs, 'send_webhook_notify', fake_notify)
+
+	asyncio.run(bs.run_site_patrol())  # 只失败 1 次
+	assert notified == [], '未达阈值不该暂停也不该通知'
+	saved = json.loads((tmp_path / 'sites.json').read_text(encoding='utf-8'))
+	assert saved[0]['auto_checkin'] is True
+
+
+def test_巡检_恢复可达时清零失败计数(monkeypatch, tmp_path):
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'sites.json')
+	monkeypatch.setattr(bs, '_SITE_STATUS_FILE', tmp_path / 'site_status.json')
+	bs._site_status.clear()
+	(tmp_path / 'sites.json').write_text(json.dumps([{'id': 't', 'label': 'T', 'domain': 'https://t.com', 'auto_checkin': True}]), encoding='utf-8')
+	monkeypatch.setattr(bs, 'site_patrol_fails', {'t': bs.SITE_PATROL_FAIL_LIMIT})
+
+	status_seq = {'down': True}
+
+	async def flaky_req(s2, method, path, headers, json_body=None, _auto_bypass=True):
+		if status_seq['down']:
+			return FakeResp(503, body='', headers={})
+		return FakeResp(200, payload={'success': True, 'data': {'version': 'v1.0'}})
+
+	monkeypatch.setattr(bs, 'newapi_request', flaky_req)
+
+	asyncio.run(bs.run_site_patrol())  # 仍失败
+	status_seq['down'] = False
+	asyncio.run(bs.run_site_patrol())  # 恢复
+	assert bs.site_patrol_fails['t'] == 0, '恢复可达应清零失败计数'
+
+
+def test_巡检_正常站点零动作(monkeypatch, tmp_path):
+	monkeypatch.setattr(bs, 'NEWAPI_SITES_FILE', tmp_path / 'sites.json')
+	monkeypatch.setattr(bs, '_SITE_STATUS_FILE', tmp_path / 'site_status.json')
+	bs._site_status.clear()
+	(tmp_path / 'sites.json').write_text(json.dumps([{'id': 't', 'label': 'T', 'domain': 'https://t.com', 'auto_checkin': True}]), encoding='utf-8')
+	monkeypatch.setattr(bs, 'site_patrol_fails', {})
+
+	async def ok_req(s2, method, path, headers, json_body=None, _auto_bypass=True):
+		return FakeResp(200, payload={'success': True, 'data': {'version': 'v1.0'}})
+
+	monkeypatch.setattr(bs, 'newapi_request', ok_req)
+	asyncio.run(bs.run_site_patrol())
+	saved = json.loads((tmp_path / 'sites.json').read_text(encoding='utf-8'))
+	assert saved[0]['auto_checkin'] is True
+	assert bs.site_patrol_fails == {'t': 0}, '成功时计数清零'

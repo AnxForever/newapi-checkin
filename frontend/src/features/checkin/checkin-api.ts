@@ -23,7 +23,11 @@ import type {
   SiteSyncResponse,
   SiteTurnstileResponse,
   TokenAccount,
+  NotifySaveResponse,
+  NotifyStatus,
+  NotifyTestResponse,
   ProtectionTestResponse,
+  SolverBalanceResponse,
   TurnstileSolverSaveResponse,
   TurnstileSolverStatus,
   TurnstileSolverTestResponse,
@@ -154,4 +158,30 @@ export function testTurnstileSolver(siteId?: string): Promise<TurnstileSolverTes
 export function testSiteProtection(siteId?: string): Promise<ProtectionTestResponse> {
   const q = siteId ? `?site_id=${encodeURIComponent(siteId)}` : "";
   return apiPost<ProtectionTestResponse>(`/protection/test${q}`);
+}
+
+// ── Webhook 通知 ─────────────────────────────────────────────────────────
+
+export function getNotify(): Promise<{ success: boolean; notify: NotifyStatus }> {
+  return apiGet<{ success: boolean; notify: NotifyStatus }>("/notify");
+}
+
+/** url 留空 = 保留已保存的值（URL 含 token，后端不回显也就无法重传） */
+export function saveNotify(patch: {
+  type: string;
+  url?: string;
+  chat_id?: string;
+  on_alert?: boolean;
+  on_checkin_failed?: boolean;
+}): Promise<NotifySaveResponse> {
+  return apiPost<NotifySaveResponse>("/notify", patch);
+}
+
+export function testNotify(): Promise<NotifyTestResponse> {
+  return apiPost<NotifyTestResponse>("/notify/test");
+}
+
+/** 查询打码平台账户余额（按需触发，不自动轮询） */
+export function getSolverBalance(): Promise<SolverBalanceResponse> {
+  return apiPost<SolverBalanceResponse>("/turnstile/solver/balance");
 }
