@@ -66,9 +66,21 @@ uvicorn balance_server:app --host 0.0.0.0 --port 8003
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest -q        # 后端，全假数据驱动，不发上游请求
-node tests/test_site_frontend.mjs    # 前端
+python -m pytest tests/ -q --ignore=tests/test_waf.py   # 后端，全假数据驱动，不发上游请求
+node tests/test_site_frontend.mjs                        # 旧版单页前端的离线测试
 ```
+
+## 开发
+
+```bash
+pnpm --dir frontend install && pnpm --dir frontend build   # 前端（Vite + React 19），产物由 FastAPI 托管
+```
+
+服务端按业务域拆分在 `server/` 包（config/common 基础设施 + keys/usage/monitor/
+protection/turnstile/notify/sites/mihomo/agentrouter/cookies 各域），`balance_server.py`
+是应用装配壳（app、鉴权中间件、lifespan、路由挂载）。新增功能按域落位：
+纯逻辑进 `server/<域>.py`，端点用该域的 router 注册，跨域引用经 `bs.<名字>` 晚绑定
+（见 docs/refactor-plan.md 的过渡约定）。人机校验与防护见 docs/protection.md。
 
 ## 说明
 

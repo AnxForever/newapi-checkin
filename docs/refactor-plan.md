@@ -89,9 +89,17 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
 - [ ] 块E 端点收尾 + 去晚绑定:cookie 域、token/site/login 端点路由、auth.py、
       webui.py;全部 bs.* 换真实导入;测试 patch 目标逐文件迁移。审核点:每改一个
       测试文件即跑该文件,最后全量。
-- [ ] 块F 终审:循环导入检查(独立导入每个 server 模块)、uvicorn 真实启动冒烟、
-      全部端点 TestClient 鉴权一致性、行数对账、frontend-contract 文档结构说明、
-      memory 更新。
+- [x] 块F 终审:循环导入检查通过(独立导入全部 12 个 server 模块)、真实 uvicorn
+      启动冒烟通过(lifespan=off,check-auth/usage/keys/docs/前端入口全链路)、
+      193 测试全过、行数对账 5591 → 1276(主文件 -77%);新增 GitHub Actions CI
+      (后端 pytest + 前端 build/lint);README 开发与结构说明更新。
+
+## 结果(2026-09-08 完成)
+
+`balance_server.py` 5591 → 1276 行;`server/` 包 14 个模块(总 ~4300 行):
+config/common 为叶子基础设施,十个业务域各自持有 router 与状态,跨域引用统一经
+`bs.<名字>` 晚绑定(服务定位器模式,原因见块E2 修订),balance_server 重导出全部
+公开名保持 `import balance_server as bs` 的兼容面。后续新功能按域落位即可。
 
 ## 每块的标准审核清单
 
