@@ -218,6 +218,7 @@ async def auth_middleware(request: Request, call_next):
 # 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；登录端点暂留主文件（块E 收口）。
 # _agentrouter_session/_agentrouter_key_sessions 暂居 server/keys.py，块E 归并到本域。
 from server.agentrouter import (  # noqa: E402
+	agentrouter_block_reason,
 	checkin_gap_seconds,
 	LoginAccountItem,
 	agentrouter_real_balance,
@@ -238,8 +239,6 @@ from server.agentrouter import (  # noqa: E402
 )
 
 
-# WAF cookies 缓存: {provider: {'cookies': dict, 'expires': float}}
-waf_cache: dict = {}
 
 ANYROUTER_CONFIG = {
 	'domain': 'https://anyrouter.top',
@@ -322,23 +321,17 @@ WAF_COOLDOWN = 45  # 所有出口 IP 都花光预算时的冷却秒数（等 WAF
 WAF_MAX_ATTEMPTS = 3  # 单个账号最多尝试次数（cookie 被滑块标记后要重登，反复被拦就放弃）
 WAF_DEADLINE = 420  # 整轮查询的时长上限（秒），超时把剩余账号报错返回
 WAF_ABORT_STREAK = 8  # 连续这么多个账号被拦且零成功就提前中止：再打只是给惩罚窗口续命
-class AccountItem(BaseModel):
-	"""传统 session cookie 方式"""
-	name: str
-	cookies: dict
-	api_user: str
+
+
+
+
 
 
 class TokenAccountItem(BaseModel):
-	"""Access Token 方式（来自 new_accounts_config.json）"""
+	"""传统 access_token 方式（new_accounts_config.json）"""
 	name: str
 	access_token: str
 	user_id: str
-	provider: str = 'anyrouter'
-
-
-
-
 
 
 class CollectRequest(BaseModel):
@@ -414,12 +407,6 @@ site_patrol_fails: dict[str, int] = {}
 
 
 
-class QueryRequest(BaseModel):
-	accounts: list[AccountItem]
-
-
-class TokenQueryRequest(BaseModel):
-	accounts: list[TokenAccountItem]
 
 
 # ========== 余额监控（已迁至 server/monitor.py） ==========
@@ -438,6 +425,128 @@ from server.monitor import (  # noqa: E402
 	monitor_router,
 )
 app.include_router(monitor_router)
+
+# ========== Cookie 域（已迁至 server/cookies.py） ==========
+# 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；cookie 相关端点暂留主文件（块E 收口）。
+from server.cookies import (  # noqa: E402
+	AccountItem,
+	waf_cache,
+	_waf_lock,
+	ANYROUTER_CONFIG,
+	_api_url,
+	anyrouter_request,
+	anyrouter_block_reason,
+	_get_waf_cookies_if_needed,
+	get_waf_cookies,
+	_query_balance_impl,
+	query_balance,
+	query_balance_with_token,
+	_sign_in_impl,
+	sign_in,
+	sign_in_with_token,
+	load_cookie_accounts,
+	_session_is_authenticated,
+	save_renewed_sessions,
+	renew_one_cookie,
+	add_anyrouter_checkin_log,
+	save_anyrouter_checkin_state,
+	load_anyrouter_checkin_state,
+	run_anyrouter_checkin,
+	start_anyrouter_checkin,
+	cookies_router,
+)
+app.include_router(cookies_router)
+
+
+# ========== 每日自动签到开关 ==========
+# AgentRouter / cookie 账号是否开启每日 0 点自动签到（持久化到 checkin_settings.json）。
+# 通用 new-api 站点的开关不在这里，而是各站点配置里的 auto_checkin，以免新增站点还要改这个字典。
+checkin_settings: dict = {
+	'agentrouter_auto': True,
+	'agentrouter_gap_min': 30,  # 缓慢签到模式：账号间隔下限（分钟）
+	'agentrouter_gap_max': 60,  # 缓慢签到模式：账号间隔上限（分钟）
+	'anyrouter_auto': True,
+}
+
+
+def load_checkin_settings():
+	"""从 checkin_settings.json 恢复自动签到开关；文件不存在则保持默认（都开启）。
+
+	历史上 gorouter 的开关也存在这个文件里（键 `gorouter_auto`），改成通用站点后它归入
+	newapi_sites.json 的 auto_checkin，这里做一次性迁移，避免用户之前关掉的开关被悄悄打开。
+	"""
+	if not CHECKIN_SETTINGS_FILE.exists():
+		return
+	try:
+		data = json.loads(CHECKIN_SETTINGS_FILE.read_text(encoding='utf-8'))
+		for k in checkin_settings:
+			if isinstance(data.get(k), bool):
+				checkin_settings[k] = data[k]
+			elif isinstance(data.get(k), int) and not isinstance(data.get(k), bool):
+				checkin_settings[k] = data[k]
+		legacy = {k[: -len('_auto')]: v for k, v in data.items() if k.endswith('_auto') and k not in checkin_settings}
+		if legacy:
+			sites = load_newapi_sites()
+			changed = False
+			for s in sites:
+				if s.id in legacy and isinstance(legacy[s.id], bool) and s.auto_checkin != legacy[s.id]:
+					s.auto_checkin = legacy[s.id]
+					changed = True
+			if changed:
+				save_newapi_sites(sites)
+				print(f'[CHECKIN] 已把旧的自动签到开关迁移到 newapi_sites.json: {legacy}')
+		# 迁移完就把旧键去掉，避免每次启动都覆盖站点里的新值
+		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
+	except Exception as e:
+		print(f'[CHECKIN] 自动签到设置读取失败: {e}')
+
+
+def save_checkin_settings():
+	"""持久化自动签到开关"""
+	try:
+		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
+	except Exception as e:
+		print(f'[CHECKIN] 自动签到设置保存失败: {e}')
+
+
+async def daily_checkin_scheduler():
+	"""每日 0 点自动启动 AgentRouter（Login）+ cookie 账号 + 所有通用 new-api 站点的签到。
+
+	AgentRouter/cookie 账号受 checkin_settings 控制，new-api 站点受各自的 auto_checkin 控制；
+	关闭后仅跳过自动触发，手动签到不受影响。新增站点会自动纳入，无需改这里。
+	"""
+	while True:
+		try:
+			wait_seconds = seconds_until_midnight()
+			print(f'[CHECKIN] 下次自动签到将在 {wait_seconds:.0f} 秒后启动')
+			await asyncio.sleep(wait_seconds + 10)  # 多等 10 秒确保过了 0 点
+			if checkin_settings['agentrouter_auto']:
+				if not checkin_state['running']:
+					start_login_checkin(trigger='auto')
+			else:
+				print('[CHECKIN] AgentRouter 每日自动签到已关闭，跳过')
+			if checkin_settings['anyrouter_auto']:
+				if not anyrouter_checkin_state['running']:
+					start_anyrouter_checkin(trigger='auto')
+			else:
+				print('[ANYROUTER] cookie 账号每日自动签到已关闭，跳过')
+			for site in load_newapi_sites():
+				if not site.auto_checkin:
+					print(f'[{site.id.upper()}] {site.label} 每日自动签到已关闭，跳过')
+					continue
+				if not newapi_state(site)['running']:
+					start_newapi_checkin(site, trigger='auto')
+		except Exception as e:
+			# 调度器是长生命周期任务：单轮出错只记日志，绝不能让异常杀死整个循环
+			print(f'[CHECKIN] 签到调度出错（下一轮继续）: {e}')
+			await asyncio.sleep(60)
+
+class QueryRequest(BaseModel):
+	accounts: list[AccountItem]
+
+
+class TokenQueryRequest(BaseModel):
+	accounts: list[TokenAccountItem]
 
 
 # Login 账号签到调度状态（内存 + 持久化到 checkin_state.json）
@@ -537,676 +646,6 @@ def _checkin_load(st: dict, path: Path, tag: str):
 		print(f'[{tag}] 状态恢复失败: {e}')
 
 
-def _api_url(path: str) -> str:
-	"""返回 API 地址"""
-	return ANYROUTER_CONFIG['domain'] + path
-
-
-async def anyrouter_request(method: str, url: str, headers: dict, cookies: dict | None = None, json_body=None):
-	"""向 anyrouter.top 发请求：curl_cffi 模拟 Chrome TLS 指纹 + 走代理（绕过 WAF/TLS 指纹检测）。
-
-	curl_cffi 是同步库，放到专用线程池执行，并按线程复用 Session 以复用代理隧道与 TLS 握手。
-
-	若响应是 WAF 挑战页，就用响应体里新的 arg1 就地重算 acw_sc__v2 再打一次（2026-08-09 实测有效）。
-	这比重新走 get_waf_cookies() 少一个请求 —— 请求数直接决定会不会撞上 ESA 的 IP 限流。
-	对 POST（签到）重试也是安全的：挑战页由阿里云边缘返回，请求没到过 new-api 源站，不会重复签到。
-	返回 curl_cffi 的 Response 对象。
-	"""
-	proxies = {'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY}
-	send = dict(cookies or {})
-
-	def _do(ck: dict):
-		sess = _get_cffi_session('anyrouter', proxies)
-		return sess.request(method.upper(), url, headers=headers, cookies=ck, json=json_body)
-
-	loop = asyncio.get_running_loop()
-	resp = await loop.run_in_executor(_UPSTREAM_POOL, _do, send)
-	if resp.status_code != 200:
-		return resp
-	try:
-		m = _WAF_CHALLENGE_RE.search(resp.text or '')
-	except Exception:
-		return resp
-	if not m:
-		return resp
-	try:
-		fresh = _solve_acw_sc_v2(m.group(1))
-	except Exception:
-		return resp
-
-	# 挑战页可能顺带下发新的 acw_tc/cdn_sec_tc（Max-Age 只有 1 小时，缓存里的可能已过期），
-	# 而 acw_sc__v2 是配着它们校验的，所以重试要用挑战页给的新值。只取 WAF 那几个名字，
-	# 避免把响应里其它 cookie（如 session）混进来。
-	try:
-		issued = dict(resp.cookies)
-	except Exception:
-		issued = {}
-	for name in ANYROUTER_CONFIG['waf_cookie_names']:
-		if issued.get(name):
-			send[name] = issued[name]
-	send['acw_sc__v2'] = fresh
-	cached = waf_cache.get('anyrouter')
-	if cached:
-		# 让同一轮里后续账号直接用新值，别再各撞一次挑战页
-		for name in ANYROUTER_CONFIG['waf_cookie_names']:
-			if send.get(name):
-				cached['cookies'][name] = send[name]
-	return await loop.run_in_executor(_UPSTREAM_POOL, _do, send)
-
-
-def anyrouter_block_reason(resp) -> tuple[str, str] | None:
-	"""判断 anyrouter.top 的响应是否被拦截，返回 (kind, 人话原因)；正常返回 None。
-
-	kind 有三种：
-	  ratelimit — 阿里云 ESA 按出口 IP 限流：403 + 正文写着「Denied by http_ratelimit」、server: ESA。
-	              实测与账号、路径、并发度都无关。2026-08-09 一次持续 28 分钟以上，2026-08-10 一次
-	              在每 2.5 分钟探一次的情况下超过 30 分钟仍未解除 —— 探测本身也算请求，很可能在给
-	              窗口续命。所以对策是**彻底停手等**，别写死"多久恢复"，也别循环重试。
-	  challenge — 仍是 WAF 挑战页（正文带 arg1），说明 acw_sc__v2 没带上或算错了。
-	  http      — 其它非 200。
-	"""
-	try:
-		body = resp.text or ''
-	except Exception:
-		body = ''
-	if resp.status_code != 200:
-		m = _ESA_DENY_RE.search(body)
-		if m:
-			rule = m.group(1)
-			if 'ratelimit' in rule.lower():
-				return ('ratelimit', '站点限流：出口 IP 被 ESA 临时封禁，请过一段时间再试，期间不要反复重试')
-			return ('http', f'被站点安全策略拦截（ESA {rule}）')
-		return ('http', f'HTTP {resp.status_code}')
-	if _WAF_CHALLENGE_RE.search(body):
-		return ('challenge', 'WAF 挑战未通过：返回的是验证页而非数据')
-	return None
-
-
-async def _get_waf_cookies_if_needed() -> dict:
-	"""获取 WAF cookies"""
-	cookies = await get_waf_cookies()
-	if cookies is None:
-		return {}
-	return cookies
-
-
-@app.get('/api/waf/warmup')
-async def waf_warmup():
-	"""预热 WAF cookies 缓存，前端页面加载时调用"""
-	cookies = await get_waf_cookies()
-	if cookies:
-		return {'success': True, 'message': 'WAF cookies 已就绪'}
-	return {'success': False, 'message': 'WAF cookies 获取失败'}
-
-
-_waf_lock = asyncio.Lock()
-
-
-async def get_waf_cookies() -> dict | None:
-	"""获取 WAF cookies（curl_cffi 求解 acw_sc__v2 挑战），带缓存 + singleflight。
-
-	阿里云 WAF 现已按 TLS 指纹（JA3）拦截无头 Chromium，导致 Playwright 直接握手失败
-	（net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH），拿不到 cookie。改用 curl_cffi 模拟
-	Chrome 指纹访问登录页，提取 acw_tc/cdn_sec_tc 并解析 arg1 计算 acw_sc__v2 即可通过校验。
-
-	加锁做 singleflight：缓存过期瞬间，warmup/查询/签到等并发调用只放一个去打挑战页，
-	其余等结果 —— 挑战页请求是要省着用的配额。
-	"""
-	cached = waf_cache.get('anyrouter')
-	if cached and cached['expires'] > time.time():
-		return cached['cookies']
-
-	async with _waf_lock:
-		# 双检：排队等锁期间可能已有同伴刷新了缓存
-		cached = waf_cache.get('anyrouter')
-		if cached and cached['expires'] > time.time():
-			return cached['cookies']
-
-		config = ANYROUTER_CONFIG
-		login_url = f'{config["domain"]}{config["login_path"]}'
-		required = config['waf_cookie_names']
-
-		def _do() -> dict:
-			from curl_cffi import requests as cffi_requests
-
-			# 这里刻意新建独立 Session（不复用 _get_cffi_session）：需要一个干净的 cookie jar
-			# 来收集登录页下发的 Set-Cookie。每 5 分钟才走一次，握手开销可忽略。
-			sess = cffi_requests.Session(
-				impersonate='chrome131',
-				proxies={'https': _LOCAL_PROXY, 'http': _LOCAL_PROXY},
-				timeout=30,
-			)
-			resp = sess.get(login_url, headers={'User-Agent': USER_AGENT})
-			waf_cookies = {}
-			for name in required:
-				val = sess.cookies.get(name)
-				if val:
-					waf_cookies[name] = val
-			m = _WAF_CHALLENGE_RE.search(resp.text)
-			if m:
-				waf_cookies['acw_sc__v2'] = _solve_acw_sc_v2(m.group(1))
-			return waf_cookies
-
-		try:
-			loop = asyncio.get_running_loop()
-			waf_cookies = await loop.run_in_executor(_UPSTREAM_POOL, _do)
-			if waf_cookies:
-				waf_cache['anyrouter'] = {
-					'cookies': waf_cookies,
-					'expires': time.time() + WAF_CACHE_TTL,
-				}
-				return waf_cookies
-			return None
-		except Exception as e:
-			print(f'[WAF] Error: {e}')
-			return None
-
-
-async def _query_balance_impl(name: str, headers: dict, cookies: dict) -> dict:
-	"""余额查询的公共实现（cookie 与 access_token 两方式只差 headers/cookies 的构造）"""
-	url = _api_url(ANYROUTER_CONFIG['user_info_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('GET', url, headers, cookies=cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': name, 'success': False, 'error': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				return {
-					'name': name,
-					'success': True,
-					'quota': round(user_data.get('quota', 0) / 500000, 2),
-					'used': round(user_data.get('used_quota', 0) / 500000, 2),
-					'username': user_data.get('username', ''),
-				}
-			return {
-				'name': name,
-				'success': False,
-				'error': f'API 返回失败: {data.get("message", "Unknown")}',
-			}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {
-				'name': name,
-				'success': False,
-				'error': f'{type(e).__name__}: {e}'[:150] or f'{type(e).__name__}',
-			}
-
-
-async def query_balance(account: AccountItem, waf_cookies: dict) -> dict:
-	"""查询单个账号余额（cookie 方式，anyrouter.top）"""
-	config = ANYROUTER_CONFIG
-	all_cookies = {**waf_cookies, **account.cookies}
-
-	headers = {
-		'User-Agent': USER_AGENT,
-		'Accept': 'application/json, text/plain, */*',
-		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Referer': config['domain'],
-		'Origin': config['domain'],
-		config['api_user_key']: account.api_user,
-	}
-	return await _query_balance_impl(account.name, headers, all_cookies)
-
-
-async def query_balance_with_token(account: TokenAccountItem, waf_cookies: dict) -> dict:
-	"""使用 access_token 查询单个账号余额（anyrouter.top）"""
-	config = ANYROUTER_CONFIG
-
-	headers = {
-		'User-Agent': USER_AGENT,
-		'Accept': 'application/json, text/plain, */*',
-		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Referer': config['domain'],
-		'Origin': config['domain'],
-		'Authorization': f'Bearer {account.access_token}',
-		config['api_user_key']: account.user_id,
-	}
-	return await _query_balance_impl(account.name, headers, waf_cookies)
-
-
-async def _sign_in_impl(name: str, headers: dict, cookies: dict) -> dict:
-	"""签到的公共实现（cookie 与 access_token 两方式只差 headers/cookies 的构造）"""
-	url = _api_url(ANYROUTER_CONFIG['sign_in_path'])
-	max_retries = 3
-
-	for attempt in range(max_retries):
-		try:
-			resp = await anyrouter_request('POST', url, headers, cookies=cookies)
-			blocked = anyrouter_block_reason(resp)
-			if blocked:
-				kind, why = blocked
-				return {'name': name, 'success': False, 'message': why, 'blocked': kind}
-			data = resp.json()
-			if data.get('success'):
-				msg = data.get('message', '')
-				# 空消息表示签到成功，有消息可能是"今日已签到"等
-				return {
-					'name': name,
-					'success': True,
-					'message': msg if msg else '签到成功 +$25',
-					'already_signed': bool(msg),
-				}
-			return {'name': name, 'success': False, 'message': data.get('message', '签到失败')}
-		except Exception as e:
-			if attempt < max_retries - 1:
-				await asyncio.sleep(1.5 * (attempt + 1))
-				continue
-			return {'name': name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
-
-
-async def sign_in(account: AccountItem, waf_cookies: dict) -> dict:
-	"""为单个账号执行签到（cookie 方式，anyrouter.top）"""
-	config = ANYROUTER_CONFIG
-	all_cookies = {**waf_cookies, **account.cookies}
-
-	headers = {
-		'User-Agent': USER_AGENT,
-		'Accept': 'application/json, text/plain, */*',
-		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Referer': f'{config["domain"]}/console',
-		'Origin': config['domain'],
-		config['api_user_key']: account.api_user,
-		'Cache-Control': 'no-store',
-	}
-	return await _sign_in_impl(account.name, headers, all_cookies)
-
-
-async def sign_in_with_token(account: TokenAccountItem, waf_cookies: dict) -> dict:
-	"""使用 access_token 为单个账号执行签到（anyrouter.top）"""
-	config = ANYROUTER_CONFIG
-
-	headers = {
-		'User-Agent': USER_AGENT,
-		'Accept': 'application/json, text/plain, */*',
-		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Referer': f'{config["domain"]}/console',
-		'Origin': config['domain'],
-		'Authorization': f'Bearer {account.access_token}',
-		config['api_user_key']: account.user_id,
-		'Cache-Control': 'no-store',
-	}
-	return await _sign_in_impl(account.name, headers, waf_cookies)
-
-
-def load_token_accounts() -> list[TokenAccountItem]:
-	"""从 new_accounts_config.json 加载 access_token 账号列表"""
-	return _read_json_models(NEW_ACCOUNTS_FILE, TokenAccountItem, 'TOKEN')
-
-
-def agentrouter_block_reason(resp) -> str | None:
-	"""认出 agentrouter 的拦截页，返回人话原因；正常返回 None。
-
-	agentrouter 也在阿里云 WAF 后面。它的拦截页与 anyrouter 的不同：**不是那种可以用
-	`_solve_acw_sc_v2()` 算出 cookie 的 `arg1` 挑战，而是滑块验证码页**（正文含
-	`aliyun_waf_aa` / `slide` / `captcha`），HTTP 仍是 200，直接 `resp.json()` 会抛
-	JSONDecodeError —— 看起来像代码坏了，其实是出口 IP 被 WAF 盯上了。
-	程序解不了滑块，唯一的办法是停手等它过去，所以这里只负责把原因说清楚。
-	"""
-	try:
-		body = resp.text or ''
-	except Exception:
-		return None
-	if resp.status_code == 429:
-		return '被站点限流（429），请等几分钟再试'
-	if 'aliyun_waf' in body or ('slide' in body and 'captcha' in body):
-		return '被阿里云 WAF 拦截（滑块验证），出口 IP 请求过多，需等一段时间自行恢复'
-	return None
-
-
-
-
-def load_login_accounts() -> list[LoginAccountItem]:
-	"""从 agentrouter_accounts.json 加载登录方式账号列表"""
-	return _read_json_models(AGENTROUTER_ACCOUNTS_FILE, LoginAccountItem, 'LOGIN')
-
-
-# ========== 通用 new-api 站点（access_token 方式）==========
-# 这一段是站点无关的：所有函数都以 NewapiSite 为第一个参数，站点清单来自 newapi_sites.json。
-# 加一个新站点不需要改这里的任何代码，只要在前端「站点管理」里填域名即可。
-
-
-
-
-
-
-# ========== 每日自动签到开关 ==========
-
-# AnyRouter / AgentRouter 是否开启每日 0 点自动签到（持久化到 checkin_settings.json）。
-# 通用 new-api 站点的开关不在这里，而是各站点配置里的 auto_checkin，以免新增站点还要改这个字典。
-checkin_settings: dict = {
-	'agentrouter_auto': True,
-	'agentrouter_gap_min': 30,  # 缓慢签到模式：账号间隔下限（分钟）
-	'agentrouter_gap_max': 60,  # 缓慢签到模式：账号间隔上限（分钟）
-	'anyrouter_auto': True,
-}
-
-
-def load_checkin_settings():
-	"""从 checkin_settings.json 恢复自动签到开关；文件不存在则保持默认（都开启）。
-
-	历史上 gorouter 的开关也存在这个文件里（键 `gorouter_auto`），改成通用站点后它归入
-	newapi_sites.json 的 auto_checkin，这里做一次性迁移，避免用户之前关掉的开关被悄悄打开。
-	"""
-	if not CHECKIN_SETTINGS_FILE.exists():
-		return
-	try:
-		data = json.loads(CHECKIN_SETTINGS_FILE.read_text(encoding='utf-8'))
-		for k in checkin_settings:
-			if isinstance(data.get(k), bool):
-				checkin_settings[k] = data[k]
-			elif isinstance(data.get(k), int) and not isinstance(data.get(k), bool):
-				checkin_settings[k] = data[k]
-		legacy = {k[: -len('_auto')]: v for k, v in data.items() if k.endswith('_auto') and k not in checkin_settings}
-		if legacy:
-			sites = load_newapi_sites()
-			changed = False
-			for s in sites:
-				if s.id in legacy and isinstance(legacy[s.id], bool) and s.auto_checkin != legacy[s.id]:
-					s.auto_checkin = legacy[s.id]
-					changed = True
-			if changed:
-				save_newapi_sites(sites)
-				print(f'[CHECKIN] 已把旧的自动签到开关迁移到 newapi_sites.json: {legacy}')
-		# 迁移完就把旧键去掉，避免每次启动都覆盖站点里的新值
-		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
-	except Exception as e:
-		print(f'[CHECKIN] 自动签到设置读取失败: {e}')
-
-
-def save_checkin_settings():
-	"""持久化自动签到开关"""
-	try:
-		_atomic_write_json(CHECKIN_SETTINGS_FILE, checkin_settings, indent=2)
-	except Exception as e:
-		print(f'[CHECKIN] 自动签到设置保存失败: {e}')
-
-
-async def daily_checkin_scheduler():
-	"""每日 0 点自动启动 AgentRouter（Login）+ AnyRouter（cookie）+ 所有通用 new-api 站点的签到。
-
-	AnyRouter/AgentRouter 受 checkin_settings 控制，new-api 站点受各自的 auto_checkin 控制；
-	关闭后仅跳过自动触发，手动签到不受影响。新增站点会自动纳入，无需改这里。
-	"""
-	while True:
-		try:
-			wait_seconds = seconds_until_midnight()
-			print(f'[CHECKIN] 下次自动签到将在 {wait_seconds:.0f} 秒后启动')
-			await asyncio.sleep(wait_seconds + 10)  # 多等 10 秒确保过了 0 点
-			if checkin_settings['agentrouter_auto']:
-				if not checkin_state['running']:
-					start_login_checkin(trigger='auto')
-			else:
-				print('[CHECKIN] AgentRouter 每日自动签到已关闭，跳过')
-			if checkin_settings['anyrouter_auto']:
-				if not anyrouter_checkin_state['running']:
-					start_anyrouter_checkin(trigger='auto')
-			else:
-				print('[ANYROUTER] AnyRouter 每日自动签到已关闭，跳过')
-			for site in load_newapi_sites():
-				if not site.auto_checkin:
-					print(f'[{site.id.upper()}] {site.label} 每日自动签到已关闭，跳过')
-					continue
-				if not newapi_state(site)['running']:
-					start_newapi_checkin(site, trigger='auto')
-		except Exception as e:
-			# 调度器是长生命周期任务：单轮出错只记日志，绝不能让异常杀死整个循环
-			print(f'[CHECKIN] 签到调度出错（下一轮继续）: {e}')
-			await asyncio.sleep(60)
-
-
-# ========== AnyRouter（cookie/session 方式）签到与续期 ==========
-
-
-def load_cookie_accounts() -> list[AccountItem]:
-	"""从 saved_config.json 加载 cookie/session 方式账号列表"""
-	if not CONFIG_FILE.exists():
-		return []
-	try:
-		data = _read_json_cached(CONFIG_FILE)
-		accounts = data.get('accounts', []) if isinstance(data, dict) else data
-		return [AccountItem(**a) for a in accounts]
-	except Exception as e:
-		print(f'[ANYROUTER] 加载 cookie 账号失败: {e}')
-		return []
-
-
-
-
-def _session_is_authenticated(session: str) -> bool | None:
-	"""从 session cookie 本地判断它是否代表已登录身份。True/False 为确定结论，None 表示判不出来。
-
-	gorilla securecookie 的载荷是 base64(时间戳|gob|HMAC)，gob 里是 gin session 的键值对明文
-	（只签名不加密）。2026-08-09 实测两种 cookie 的差别很干净：
-
-	  匿名（未登录时调 /api/oauth/state 得到）：176 字节，只有 oauth_state
-	  已登录：496 字节，含 id / username / role / status / group / aff
-
-	所以有 `id` 键即已登录。这样就不必为每个账号多打一次 /api/user/self —— 请求数直接决定
-	会不会撞上 ESA 的 IP 限流，27 个账号能从 54 个请求降到 27 个。
-
-	判不出来时返回 None 而不是 False：new-api 换了 session 结构的话，宁可退回打接口核实，
-	也不要把好账号误报成"已失效，请重新登录"。
-	"""
-	try:
-		raw = base64.urlsafe_b64decode(session + '=' * (-len(session) % 4))
-		parts = raw.split(b'|')
-		if len(parts) < 2:
-			return None
-		gob = base64.urlsafe_b64decode(parts[1] + b'=' * (-len(parts[1]) % 4))
-	except Exception:
-		return None
-	if b'oauth_state' not in gob:
-		return None  # 连预期的键都没有，说明结构变了，交给接口核实
-	# gob 的字符串键以「长度字节 + 内容」编码，用 \x02id 精确匹配，避免撞上 username 里的 "id"
-	return b'\x02id' in gob
-
-
-def add_anyrouter_checkin_log(msg: str):
-	_checkin_add_log(anyrouter_checkin_state, 'ANYROUTER', msg)
-
-
-def save_anyrouter_checkin_state():
-	"""持久化 AnyRouter 签到状态"""
-	_checkin_save(anyrouter_checkin_state, ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
-
-
-def load_anyrouter_checkin_state():
-	"""服务启动时恢复 AnyRouter 签到状态（仅用于前端展示历史进度）"""
-	_checkin_load(anyrouter_checkin_state, ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
-
-
-async def run_anyrouter_checkin(trigger: str = 'manual'):
-	"""执行 AnyRouter 签到：cookie 账号并发签到（Semaphore ANYROUTER_CONCURRENCY），数秒内完成。"""
-	accounts = load_cookie_accounts()
-	st = anyrouter_checkin_state
-	today = datetime.now().strftime('%Y-%m-%d')
-	st['running'] = True
-	st['date'] = today
-	st['trigger'] = trigger
-	st['started_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	st['finished_at'] = None
-	st['total'] = len(accounts)
-	st['signed'] = 0
-	st['already'] = 0
-	st['failed'] = 0
-	st['accounts'] = {a.name: {'status': 'pending', 'message': '等待签到', 'time': None} for a in accounts}
-	st['logs'] = []
-	add_anyrouter_checkin_log(f'开始 AnyRouter 签到（{trigger}），共 {len(accounts)} 个 cookie 账号')
-	save_anyrouter_checkin_state()
-
-	def _finish():
-		st['signed'] = sum(1 for v in st['accounts'].values() if v['status'] == 'signed')
-		st['already'] = sum(1 for v in st['accounts'].values() if v['status'] == 'already')
-		st['failed'] = sum(1 for v in st['accounts'].values() if v['status'] == 'failed')
-		st['running'] = False
-		st['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		add_anyrouter_checkin_log(
-			f'AnyRouter 签到结束：成功 {st["signed"]} · 今日已签 {st["already"]} · 失败 {st["failed"]}'
-		)
-		save_anyrouter_checkin_state()
-
-	if not accounts:
-		add_anyrouter_checkin_log('没有 cookie 账号，AnyRouter 签到结束')
-		_finish()
-		return
-
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies:
-		ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		for name in st['accounts']:
-			st['accounts'][name] = {'status': 'failed', 'message': 'WAF cookies 获取失败', 'time': ts}
-		add_anyrouter_checkin_log('WAF cookies 获取失败，AnyRouter 签到中止')
-		_finish()
-		return
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-
-	async def _one(acc: AccountItem):
-		async with sem:
-			if not st['running']:
-				return
-			result = await sign_in(acc, waf_cookies)
-			ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-			if result.get('success'):
-				status = 'already' if result.get('already_signed') else 'signed'
-				st['accounts'][acc.name] = {'status': status, 'message': result.get('message', '签到成功'), 'time': ts}
-			else:
-				st['accounts'][acc.name] = {'status': 'failed', 'message': result.get('message', '签到失败'), 'time': ts}
-			add_anyrouter_checkin_log(f'{acc.name}: {st["accounts"][acc.name]["message"]}')
-			save_anyrouter_checkin_state()
-
-	await asyncio.gather(*[_one(a) for a in accounts])
-	_finish()
-
-
-def start_anyrouter_checkin(trigger: str = 'manual') -> bool:
-	"""启动 AnyRouter 签到任务，若已在运行则返回 False"""
-	if anyrouter_checkin_state['running']:
-		return False
-	anyrouter_checkin_state['task'] = asyncio.create_task(run_anyrouter_checkin(trigger))
-	return True
-
-
-def _anyrouter_checkin_status_payload() -> dict:
-	"""组装 AnyRouter 签到状态返回体"""
-	st = anyrouter_checkin_state
-	accounts = [
-		{'name': name, 'status': info.get('status', 'pending'), 'message': info.get('message', ''), 'time': info.get('time')}
-		for name, info in st['accounts'].items()
-	]
-	signed = sum(1 for a in accounts if a['status'] in ('signed', 'already'))
-	failed = sum(1 for a in accounts if a['status'] == 'failed')
-	return {
-		'running': st['running'],
-		'date': st['date'],
-		'trigger': st['trigger'],
-		'started_at': st['started_at'],
-		'finished_at': st['finished_at'],
-		'total': st['total'],
-		'done': signed + failed,
-		'signed': signed,
-		'failed': failed,
-		'accounts': accounts,
-		'logs': st['logs'][-30:],
-	}
-
-
-# ========== 通用 new-api 站点签到调度 ==========
-# 每个站点一份独立状态，存在 newapi_checkin_states[site_id]，持久化到站点自己的 state_file。
-
-
-
-
-def save_renewed_sessions(updates: dict):
-	"""把续期得到的新 session 批量写回 saved_config.json（按账号名匹配）"""
-	if not updates or not CONFIG_FILE.exists():
-		return
-	try:
-		data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-		accounts = data.get('accounts', []) if isinstance(data, dict) else data
-		for a in accounts:
-			if a.get('name') in updates:
-				a.setdefault('cookies', {})['session'] = updates[a['name']]
-		_atomic_write_json(CONFIG_FILE, data, indent=2)
-	except Exception as e:
-		print(f'[ANYROUTER] 写回续期 session 失败: {e}')
-
-
-async def renew_one_cookie(account: AccountItem, waf_cookies: dict) -> dict:
-	"""续期单个 cookie 账号的 session（+30 天）。
-
-	调用 GET /api/oauth/state 触发服务端 session.Save() 重发 cookie。拿到新 cookie 后必须确认它
-	仍代表已登录身份 —— 已过期的 session 打这个接口同样会 200 + 下发一个**匿名** cookie，写回去
-	就把登录态弄丢了。优先用本地解码判断（零请求），只在解码判不出来时才打 /api/user/self 核实。
-	"""
-	base = ANYROUTER_CONFIG['domain']
-	headers = {
-		'User-Agent': USER_AGENT,
-		'Accept': 'application/json, text/plain, */*',
-		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-		'Referer': f'{base}/console',
-		'Origin': base,
-		ANYROUTER_CONFIG['api_user_key']: account.api_user,
-		'Cache-Control': 'no-store',
-	}
-	try:
-		all_cookies = {**waf_cookies, **account.cookies}
-		resp = await anyrouter_request('GET', base + '/api/oauth/state', headers, cookies=all_cookies)
-		blocked = anyrouter_block_reason(resp)
-		if blocked:
-			kind, why = blocked
-			return {'name': account.name, 'success': False, 'message': f'续期失败 · {why}', 'blocked': kind}
-		try:
-			new_session = resp.cookies.get('session')
-		except Exception:
-			new_session = None
-		if not new_session:
-			return {'name': account.name, 'success': False, 'message': '续期接口未下发新 cookie（接口可能已变更）'}
-
-		# 本地解码判身份：匿名 cookie 的 gob 里只有 oauth_state，登录 cookie 才带 id/username（已实测）
-		authed = _session_is_authenticated(new_session)
-		if authed is not True:
-			# 解码判不出来（新版 new-api 可能换了 session 结构），退回打一次接口核实，别误判成失效
-			check = await anyrouter_request(
-				'GET', base + '/api/user/self', headers, cookies={**waf_cookies, 'session': new_session}
-			)
-			blocked = anyrouter_block_reason(check)
-			if blocked:
-				kind, why = blocked
-				# 这里是核实请求被拦，不代表 cookie 有问题，别提示"重新登录"把人带偏
-				return {
-					'name': account.name,
-					'success': False,
-					'message': f'新 cookie 无法核实 · {why}',
-					'blocked': kind,
-				}
-			ok = False
-			try:
-				cd = check.json()
-				ok = bool(cd.get('success')) and cd.get('data', {}).get('id') is not None
-			except Exception:
-				ok = False
-			if not ok:
-				return {'name': account.name, 'success': False, 'message': 'cookie 已失效，无法续期，请重新登录'}
-		info = _session_expiry_info(new_session) or {}
-		return {
-			'name': account.name,
-			'success': True,
-			'message': '续期成功',
-			'new_session': new_session,
-			'expires_at': info.get('expires_at'),
-			'days_left': info.get('days_left'),
-		}
-	except Exception as e:
-		return {'name': account.name, 'success': False, 'message': f'{type(e).__name__}: {e}'[:100]}
 
 
 # ── 前端入口 ────────────────────────────────────────────────────────────────
@@ -2409,6 +1848,11 @@ from server.usage import (  # noqa: E402
 	usage_router,
 )
 app.include_router(usage_router)
+
+def load_token_accounts() -> list[TokenAccountItem]:
+	"""从 new_accounts_config.json 加载 access_token 账号列表"""
+	return _read_json_models(NEW_ACCOUNTS_FILE, TokenAccountItem, 'TOKEN')
+
 async def startup_event():
 	"""服务启动时初始化定时任务"""
 	# 先把用量快照的 key 迁移成「站点:账号名」，再判断今日有没有快照 —— 顺序反了会用旧 key 判断

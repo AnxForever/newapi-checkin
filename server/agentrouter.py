@@ -65,6 +65,26 @@ def load_checkin_state():
 	bs._checkin_load(bs.checkin_state, bs.CHECKIN_STATE_FILE, 'CHECKIN')
 
 
+def agentrouter_block_reason(resp) -> str | None:
+	"""认出 agentrouter 的拦截页，返回人话原因；正常返回 None。
+
+	agentrouter 也在阿里云 WAF 后面。它的拦截页与 anyrouter 的不同：**不是那种可以用
+	`_solve_acw_sc_v2()` 算出 cookie 的 `arg1` 挑战，而是滑块验证码页**（正文含
+	`aliyun_waf_aa` / `slide` / `captcha`），HTTP 仍是 200，直接 `resp.json()` 会抛
+	JSONDecodeError —— 看起来像代码坏了，其实是出口 IP 被 WAF 盯上了。
+	程序解不了滑块，唯一的办法是停手等它过去，所以这里只负责把原因说清楚。
+	"""
+	try:
+		body = resp.text or ''
+	except Exception:
+		return None
+	if resp.status_code == 429:
+		return '被站点限流（429），请等几分钟再试'
+	if 'aliyun_waf' in body or ('slide' in body and 'captcha' in body):
+		return '被阿里云 WAF 拦截（滑块验证），出口 IP 请求过多，需等一段时间自行恢复'
+	return None
+
+
 async def agentrouter_real_balance(cookies: dict, user_id: str) -> tuple[dict | None, str | None]:
 	"""登录之后再读一次 `/api/user/self` 取真实余额，返回 (余额, 失败原因)。
 
@@ -222,7 +242,7 @@ async def sign_in_login(account: LoginAccountItem) -> dict:
 			# 免得把 0 写进今日基线，那会让这个账号当天的用量永远算不出来。
 			real, why = await agentrouter_real_balance(jar, str(user_data.get('id') or ''))
 			if real is None:
-				add_checkin_log(f'{account.name}: 签到成功但读取余额失败（{why}），本次不记用量')
+				bs.add_checkin_log(f'{account.name}: 签到成功但读取余额失败（{why}），本次不记用量')
 			return {
 				'name': account.name,
 				'success': True,
@@ -267,7 +287,7 @@ async def run_login_checkin(trigger: str = 'manual'):
 
 	accounts = load_login_accounts()
 	if not accounts:
-		add_checkin_log('没有 Login 账号，签到流程结束')
+		bs.add_checkin_log('没有 Login 账号，签到流程结束')
 		bs.checkin_state['running'] = False
 		return
 
@@ -290,8 +310,8 @@ async def run_login_checkin(trigger: str = 'manual'):
 		a.name: {'status': 'pending', 'message': '等待签到', 'time': None} for a in order
 	}
 	bs.checkin_state['logs'] = []
-	add_checkin_log(f'开始签到流程（{trigger}），共 {len(order)} 个账号，随机顺序')
-	save_checkin_state()
+	bs.add_checkin_log(f'开始签到流程（{trigger}），共 {len(order)} 个账号，随机顺序')
+	bs.save_checkin_state()
 
 	# 队列模型：失败的账号排到队尾稍后重试，确保所有账号都签到完。
 	# 每次签到之间（含重试）随机等待 30~60 分钟，那时按 IP 的限流早已恢复。
@@ -302,11 +322,11 @@ async def run_login_checkin(trigger: str = 'manual'):
 	async def _wait_between():
 		"""签到间随机等待，分段睡眠以便及时响应停止"""
 		bs.checkin_state['current'] = None
-		delay = checkin_gap_seconds()
+		delay = bs.checkin_gap_seconds()
 		next_time = datetime.now().timestamp() + delay
 		bs.checkin_state['next_at'] = datetime.fromtimestamp(next_time).strftime('%Y-%m-%d %H:%M:%S')
-		add_checkin_log(f'下一个账号将在 {delay // 60} 分钟后（{bs.checkin_state["next_at"]}）签到')
-		save_checkin_state()
+		bs.add_checkin_log(f'下一个账号将在 {delay // 60} 分钟后（{bs.checkin_state["next_at"]}）签到')
+		bs.save_checkin_state()
 		for _ in range(delay):
 			if not bs.checkin_state['running']:
 				break
@@ -314,7 +334,7 @@ async def run_login_checkin(trigger: str = 'manual'):
 
 	while queue:
 		if not bs.checkin_state['running']:
-			add_checkin_log('收到停止指令，签到流程中断')
+			bs.add_checkin_log('收到停止指令，签到流程中断')
 			break
 
 		acc, attempt = queue.popleft()
@@ -323,13 +343,13 @@ async def run_login_checkin(trigger: str = 'manual'):
 		if processed_any:
 			await _wait_between()
 			if not bs.checkin_state['running']:
-				add_checkin_log('收到停止指令，签到流程中断')
+				bs.add_checkin_log('收到停止指令，签到流程中断')
 				break
 		processed_any = True
 
 		bs.checkin_state['current'] = acc.name
 		bs.checkin_state['next_at'] = None
-		save_checkin_state()
+		bs.save_checkin_state()
 
 		result = await bs.sign_in_login(acc)
 
@@ -348,7 +368,7 @@ async def run_login_checkin(trigger: str = 'manual'):
 			# 把本次拿到的余额写入今日用量快照（Login 账号余额仅在此处获取，不再单独查登录接口）
 			if result.get('quota') is not None:
 				bs.record_account_usage('agentrouter', acc.name, result.get('used', 0), result.get('quota', 0))
-			add_checkin_log(f'{acc.name}: {msg}')
+			bs.add_checkin_log(f'{acc.name}: {msg}')
 		else:
 			msg = result.get('message', '签到失败')
 			if attempt < MAX_ATTEMPTS:
@@ -359,19 +379,19 @@ async def run_login_checkin(trigger: str = 'manual'):
 					'message': f'{msg}（第 {attempt} 次失败，稍后重试）',
 					'time': ts,
 				}
-				add_checkin_log(f'{acc.name}: {msg} — 已排入重试队列（{attempt}/{MAX_ATTEMPTS}）')
+				bs.add_checkin_log(f'{acc.name}: {msg} — 已排入重试队列（{attempt}/{MAX_ATTEMPTS}）')
 			else:
 				bs.checkin_state['accounts'][acc.name] = {'status': 'failed', 'message': msg, 'time': ts}
-				add_checkin_log(f'{acc.name}: {msg} — 已达最大重试次数，放弃')
-		save_checkin_state()
+				bs.add_checkin_log(f'{acc.name}: {msg} — 已达最大重试次数，放弃')
+		bs.save_checkin_state()
 
 	bs.checkin_state['running'] = False
 	bs.checkin_state['current'] = None
 	bs.checkin_state['next_at'] = None
 	bs.checkin_state['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 	signed = sum(1 for v in bs.checkin_state['accounts'].values() if v['status'] in ('signed', 'already'))
-	add_checkin_log(f'签到流程结束：{signed}/{bs.checkin_state["total"]} 个账号已签到')
-	save_checkin_state()
+	bs.add_checkin_log(f'签到流程结束：{signed}/{bs.checkin_state["total"]} 个账号已签到')
+	bs.save_checkin_state()
 
 
 def start_login_checkin(trigger: str = 'manual') -> bool:

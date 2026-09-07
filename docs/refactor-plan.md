@@ -73,8 +73,13 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
       checkin_gap_seconds、Login 状态助手、run/start_login_checkin、
       _session_expiry_info、_run_with_rotation 轮换调度、login 余额)。7 端点鉴权一致。
       _agentrouter_session 暂居 keys.py 经 bs. 引用(块E 归并);登录端点暂留主文件。
-- [ ] 块D3 cookies.py(cookie 域:WAF cookies、query_balance(+with_token)、
-      续期、cookie 签到)+ 块E 端点收尾 + 去晚绑定 + 测试 patch 目标迁移。
+- [x] 块D3 cookies.py(WAF cookies 求解/预热端点、query_balance(+with_token)、
+      sign_in(+with_token)、续期与 session 本地解码、cookie 签到流程、AccountItem/
+      ANYROUTER_CONFIG/waf_cache)。审核修复:D2 遗留回归——run_login_checkin 的
+      状态助手调用未走 bs.，fast_checkin_env 的落盘隔离 patch 拦不住（会写真实
+      checkin_state.json），已改为全部经 bs.；跨域误吞的 TokenAccountItem/
+      checkin_settings 节/agentrouter_block_reason/load_token_accounts 逐一归位。
+- [ ] 块E 端点收尾 + 去晚绑定 + 测试 patch 目标迁移。
 - [ ] 块E 端点收尾 + 去晚绑定:cookie 域、token/site/login 端点路由、auth.py、
       webui.py;全部 bs.* 换真实导入;测试 patch 目标逐文件迁移。审核点:每改一个
       测试文件即跑该文件,最后全量。
