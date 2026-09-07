@@ -236,6 +236,14 @@ from server.agentrouter import (  # noqa: E402
 	_run_with_rotation,
 	_query_login_balances,
 	_sign_in_one,
+	get_login_accounts,
+	save_login_accounts,
+	query_login_accounts,
+	login_checkin_fast,
+	login_checkin_start,
+	login_checkin_stop,
+	login_checkin_status,
+	login_accounts_balances,
 )
 
 
@@ -307,6 +315,8 @@ from server.mihomo import (  # noqa: E402
 	_MihomoGroupSwitcher,
 	ExitRotator,
 	_KeysExitRotator,
+	get_proxy_info,
+	get_proxy_info,
 )
 
 # 出口代数计数器：mihomo.ExitRotator 递增、_ar_session_key 读取；测试观察/重绑，家在 bs
@@ -399,6 +409,17 @@ from server.sites import (  # noqa: E402
 	SITE_PATROL_INTERVAL,
 	SITE_PATROL_FIRST_DELAY,
 	SITE_PATROL_FAIL_LIMIT,
+	save_sites,
+	probe_site,
+	get_site_accounts,
+	post_site_accounts,
+	query_site,
+	site_checkin_start,
+	site_turnstile,
+	site_checkin_status,
+	site_checkin_sync,
+	site_checkin_info_all,
+	_site_or_error,
 )
 
 # 巡检失败计数（测试会整体重绑，故家在 bs；sites.run_site_patrol 经 bs. 读写）
@@ -430,6 +451,7 @@ app.include_router(monitor_router)
 # 过渡期约定同前：域模块函数体内晚绑定 bs.<名字>；cookie 相关端点暂留主文件（块E 收口）。
 from server.cookies import (  # noqa: E402
 	AccountItem,
+	TokenAccountItem,
 	waf_cache,
 	_waf_lock,
 	ANYROUTER_CONFIG,
@@ -453,7 +475,27 @@ from server.cookies import (  # noqa: E402
 	load_anyrouter_checkin_state,
 	run_anyrouter_checkin,
 	start_anyrouter_checkin,
+	query,
+	checkin,
+	get_token_accounts,
+	save_token_accounts,
+	query_with_token,
+	checkin_with_token,
+	anyrouter_checkin_start,
+	anyrouter_checkin_status,
+	anyrouter_cookie_status,
+	anyrouter_renew,
 	cookies_router,
+	query,
+	checkin,
+	get_token_accounts,
+	save_token_accounts,
+	query_with_token,
+	checkin_with_token,
+	anyrouter_checkin_start,
+	anyrouter_checkin_status,
+	anyrouter_cookie_status,
+	anyrouter_renew,
 )
 app.include_router(cookies_router)
 
@@ -540,14 +582,6 @@ async def daily_checkin_scheduler():
 			# 调度器是长生命周期任务：单轮出错只记日志，绝不能让异常杀死整个循环
 			print(f'[CHECKIN] 签到调度出错（下一轮继续）: {e}')
 			await asyncio.sleep(60)
-
-class QueryRequest(BaseModel):
-	accounts: list[AccountItem]
-
-
-class TokenQueryRequest(BaseModel):
-	accounts: list[TokenAccountItem]
-
 
 # Login 账号签到调度状态（内存 + 持久化到 checkin_state.json）
 checkin_state: dict = {
@@ -706,347 +740,10 @@ async def save_config(req: dict):
 		return {'success': False, 'error': str(e)}
 
 
-@app.post('/api/query')
-async def query(req: QueryRequest):
-	"""批量查询账号余额"""
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies :
-		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-
-	async def limited_query(acc):
-		async with sem:
-			return await query_balance(acc, waf_cookies)
-
-	tasks = [limited_query(acc) for acc in req.accounts]
-	results = await asyncio.gather(*tasks)
-
-	total_quota = sum(r.get('quota', 0) for r in results if r.get('success'))
-	total_used = sum(r.get('used', 0) for r in results if r.get('success'))
-
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total_quota': round(total_quota, 2),
-			'total_used': round(total_used, 2),
-			'account_count': len(results),
-			'success_count': sum(1 for r in results if r.get('success')),
-		},
-	}
-
-
-@app.post('/api/checkin')
-async def checkin(req: QueryRequest):
-	"""批量签到"""
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies :
-		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-
-	async def limited_sign_in(acc):
-		async with sem:
-			return await sign_in(acc, waf_cookies)
-
-	tasks = [limited_sign_in(acc) for acc in req.accounts]
-	results = await asyncio.gather(*tasks)
-
-	success_count = sum(1 for r in results if r.get('success'))
-	new_sign_count = sum(1 for r in results if r.get('success') and not r.get('already_signed'))
-
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total': len(results),
-			'success': success_count,
-			'new_signed': new_sign_count,
-		},
-	}
-
-
 # ========== Access Token 方式的接口 ==========
 
 
-@app.get('/api/token/accounts')
-async def get_token_accounts():
-	"""获取 new_accounts_config.json 中的账号列表（含完整信息，用于管理）"""
-	accounts = load_token_accounts()
-	return {
-		'success': True,
-		'accounts': [acc.model_dump() for acc in accounts],
-	}
-
-
-@app.post('/api/token/accounts')
-async def save_token_accounts(req: dict):
-	"""保存 token 账号列表到 new_accounts_config.json"""
-	try:
-		raw_accounts = req.get('accounts', [])
-		validated = [TokenAccountItem(**acc) for acc in raw_accounts]
-		_atomic_write_json(NEW_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
-		return {'success': True}
-	except Exception as e:
-		return {'success': False, 'error': str(e)}
-
-
-@app.post('/api/token/query')
-async def query_with_token(req: TokenQueryRequest | None = None):
-	"""使用 access_token 批量查询账号余额
-	如果不传 accounts，则从 new_accounts_config.json 读取
-	"""
-	if req and req.accounts:
-		accounts = req.accounts
-	else:
-		accounts = load_token_accounts()
-		if not accounts:
-			return {'success': False, 'error': 'new_accounts_config.json 不存在或为空'}
-
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies :
-		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-
-	async def limited_query(acc):
-		async with sem:
-			return await query_balance_with_token(acc, waf_cookies)
-
-	tasks = [limited_query(acc) for acc in accounts]
-	results = await asyncio.gather(*tasks)
-
-	total_quota = sum(r.get('quota', 0) for r in results if r.get('success'))
-	total_used = sum(r.get('used', 0) for r in results if r.get('success'))
-
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total_quota': round(total_quota, 2),
-			'total_used': round(total_used, 2),
-			'account_count': len(results),
-			'success_count': sum(1 for r in results if r.get('success')),
-		},
-	}
-
-
-@app.post('/api/token/checkin')
-async def checkin_with_token(req: TokenQueryRequest | None = None):
-	"""使用 access_token 批量签到
-	如果不传 accounts，则从 new_accounts_config.json 读取
-	"""
-	if req and req.accounts:
-		accounts = req.accounts
-	else:
-		accounts = load_token_accounts()
-		if not accounts:
-			return {'success': False, 'error': 'new_accounts_config.json 不存在或为空'}
-
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies :
-		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-
-	async def limited_sign_in(acc):
-		async with sem:
-			return await sign_in_with_token(acc, waf_cookies)
-
-	tasks = [limited_sign_in(acc) for acc in accounts]
-	results = await asyncio.gather(*tasks)
-
-	success_count = sum(1 for r in results if r.get('success'))
-	new_sign_count = sum(1 for r in results if r.get('success') and not r.get('already_signed'))
-
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total': len(results),
-			'success': success_count,
-			'new_signed': new_sign_count,
-		},
-	}
-
-
 # ========== Login 方式的接口（agentrouter.org）==========
-
-
-@app.get('/api/login-accounts/accounts')
-async def get_login_accounts():
-	"""获取 agentrouter_accounts.json 中的账号列表"""
-	accounts = load_login_accounts()
-	return {'success': True, 'accounts': [acc.model_dump() for acc in accounts]}
-
-
-@app.post('/api/login-accounts/accounts')
-async def save_login_accounts(req: dict):
-	"""保存登录方式账号列表"""
-	try:
-		raw_accounts = req.get('accounts', [])
-		validated = [LoginAccountItem(**acc) for acc in raw_accounts]
-		_atomic_write_json(AGENTROUTER_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
-		return {'success': True}
-	except Exception as e:
-		return {'success': False, 'error': str(e)}
-
-
-@app.post('/api/login-accounts/query')
-async def query_login_accounts():
-	"""查询所有 agentrouter.org 账号余额"""
-	accounts = load_login_accounts()
-	if not accounts:
-		return {'success': False, 'error': 'agentrouter_accounts.json 不存在或为空'}
-
-	# 登录接口有按 IP 限流，顺序处理并在账号之间加延迟以规避 429
-	results = []
-	for i, acc in enumerate(accounts):
-		if i > 0:
-			await asyncio.sleep(1.5)
-		results.append(await query_balance_login(acc))
-	total_quota = sum(r.get('quota', 0) for r in results if r.get('success'))
-	total_used = sum(r.get('used', 0) for r in results if r.get('success'))
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total_quota': round(total_quota, 2),
-			'total_used': round(total_used, 2),
-			'account_count': len(results),
-			'success_count': sum(1 for r in results if r.get('success')),
-		},
-	}
-
-
-@app.post('/api/login-accounts/checkin/fast')
-async def login_checkin_fast():
-	"""一键全签：轮换出口 IP 分批登录（agentrouter 登录即签到），约 1~2 分钟跑完。
-
-	与 /checkin/start 的缓慢模式（账号间隔默认 30~60 分钟，可在设置里改）互补。
-	出口轮换是全局动作，与余额查询共用一把锁；今天已签到的账号直接跳过，省 WAF 配额。
-	"""
-	accounts = load_login_accounts()
-	if not accounts:
-		return {'success': False, 'error': 'agentrouter_accounts.json 不存在或为空'}
-	if checkin_state['running']:
-		return {'success': False, 'error': '签到流程正在运行（缓慢模式不可打断），请先停止或等它结束'}
-	if _balances_query_lock.locked():
-		return {'success': False, 'error': '已有一轮出口轮换任务（余额查询/全签到）在进行中，请等它结束再点'}
-
-	# 今天已签到的账号跳过：登录即签到，已签过再登一次既没意义又白耗 WAF 配额
-	today = datetime.now().strftime('%Y-%m-%d')
-	done_status: dict = {}
-	if checkin_state.get('date') == today:
-		done_status = {
-			n: v
-			for n, v in (checkin_state.get('accounts') or {}).items()
-			if v.get('status') in ('signed', 'already')
-		}
-	pending = [a for a in accounts if a.name not in done_status]
-
-	checkin_state.update(
-		running=True,
-		date=today,
-		trigger='fast',
-		mode='fast',
-		started_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-		finished_at=None,
-		total=len(accounts),
-		done=len(done_status),
-		order=[a.name for a in accounts],
-		current=None,
-		next_at=None,
-		logs=[],
-	)
-	checkin_state['accounts'] = {
-		a.name: done_status.get(a.name) or {'status': 'pending', 'message': '等待签到', 'time': None}
-		for a in accounts
-	}
-	add_checkin_log(f'一键全签开始（轮换出口）：{len(pending)} 个待签 / {len(done_status)} 个今日已签跳过')
-	save_checkin_state()
-
-	def _on_result(account, r):
-		ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		if r.get('success'):
-			checkin_state['accounts'][account.name] = {
-				'status': 'already' if r.get('already_signed') else 'signed',
-				'message': r.get('message', '签到成功'),
-				'time': ts,
-				'quota': r.get('quota'),
-				'used': r.get('used'),
-			}
-			# 登录响应顺带拿到的余额写进今日快照（quota 为 None 说明没取到，跳过记账）
-			if r.get('quota') is not None:
-				record_account_usage('agentrouter', account.name, r.get('used', 0), r.get('quota', 0))
-			add_checkin_log(f'{account.name}: {r.get("message", "签到成功")}')
-		else:
-			msg = r.get('error') or r.get('message') or '签到失败'
-			checkin_state['accounts'][account.name] = {'status': 'failed', 'message': msg, 'time': ts}
-			add_checkin_log(f'{account.name}: 签到失败 — {msg}')
-		checkin_state['done'] = sum(
-			1 for v in checkin_state['accounts'].values() if v.get('status') in ('signed', 'already', 'failed')
-		)
-		save_checkin_state()
-
-	results: list = []
-	aborted = False
-	if pending:
-		async with _balances_query_lock:
-			# 停止按钮置 running=False，轮换调度每轮开始前检查它 —— fast 模式从此可停
-			results, aborted = await _run_with_rotation(
-				pending, _sign_in_one, on_result=_on_result, should_stop=lambda: not checkin_state['running']
-			)
-	else:
-		add_checkin_log('全部账号今日都已签到，无需签到')
-
-	stopped = not checkin_state['running']  # 停止按钮已把 running 置 False
-	checkin_state['running'] = False
-	checkin_state['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	signed = sum(1 for v in checkin_state['accounts'].values() if v.get('status') in ('signed', 'already'))
-	failed = sum(1 for v in checkin_state['accounts'].values() if v.get('status') == 'failed')
-	add_checkin_log(
-		f'一键全签结束：{signed}/{checkin_state["total"]} 已签到，失败 {failed}'
-		+ ('（WAF 惩罚期提前中止）' if aborted else '')
-		+ ('（手动停止）' if stopped else '')
-	)
-	save_checkin_state()
-	return {
-		'success': True,
-		'summary': {
-			'total': len(accounts),
-			'new_signed': sum(1 for r in results if r.get('success') and not r.get('already_signed')),
-			'already': sum(1 for r in results if r.get('already_signed')) + len(done_status),
-			'failed': failed,
-			'aborted': aborted,
-		},
-		'status': _checkin_status_payload(),
-	}
-
-
-@app.post('/api/login-accounts/checkin/start')
-async def login_checkin_start():
-	"""启动 Login 账号签到流程（随机顺序、账号间随机等待 30~60 分钟）"""
-	if checkin_state['running']:
-		return {'success': False, 'error': '签到流程已在运行中', 'status': _checkin_status_payload()}
-	accounts = load_login_accounts()
-	if not accounts:
-		return {'success': False, 'error': 'agentrouter_accounts.json 不存在或为空'}
-	start_login_checkin(trigger='manual')
-	# 稍等片刻让任务初始化状态
-	await asyncio.sleep(0.2)
-	return {'success': True, 'message': f'签到流程已启动，共 {len(accounts)} 个账号', 'status': _checkin_status_payload()}
-
-
-@app.post('/api/login-accounts/checkin/stop')
-async def login_checkin_stop():
-	"""停止正在运行的 Login 账号签到流程"""
-	if not checkin_state['running']:
-		return {'success': False, 'error': '当前没有正在运行的签到流程'}
-	checkin_state['running'] = False
-	add_checkin_log('收到停止指令')
-	return {'success': True, 'message': '已发送停止指令'}
 
 
 def _checkin_status_payload() -> dict:
@@ -1085,12 +782,6 @@ def _checkin_status_payload() -> dict:
 		'accounts': accounts,
 		'logs': checkin_state['logs'][-30:],
 	}
-
-
-@app.get('/api/login-accounts/checkin/status')
-async def login_checkin_status():
-	"""获取 Login 账号签到流程的进度状态"""
-	return {'success': True, 'status': _checkin_status_payload()}
 
 
 def _all_checkin_settings() -> dict:
@@ -1162,170 +853,11 @@ async def update_checkin_settings(req: dict):
 
 
 
-@app.get('/api/login-accounts/balances')
-async def login_accounts_balances(live: bool = False, names: str = ''):
-	"""返回每个 agentrouter（Login）账号的余额。
-
-	复用缓存 session 只打 /api/user/self；`live=true` 强制全部重登；`names=a,b` 只查指定账号
-	（按名字精确匹配，逗号分隔）。结果写进今日快照当基线，今日用量从第二次查询起就能算出来。
-
-	因为 WAF 按出口 IP + cookie 拦截（见 ExitRotator 的注释），这里不能全量并发：
-	_query_login_balances 分批轮换出口 IP，一轮全量约 1~2 分钟。轮换是全局动作，
-	同一时刻只允许一轮查询（重复点击会收到「查询进行中」）。
-	"""
-	accounts = load_login_accounts()
-	if names:
-		wanted = {n.strip() for n in names.split(',') if n.strip()}
-		accounts = [a for a in accounts if a.name in wanted]
-	if not accounts:
-		return {
-			'success': True,
-			'results': [],
-			'summary': {'total_quota': 0, 'total_used': 0, 'account_count': 0, 'success_count': 0},
-		}
-	if _balances_query_lock.locked():
-		return {'success': False, 'error': '已有一轮 AgentRouter 查询在进行中（要轮换出口 IP，必须独占），请等它结束再点'}
-	async with _balances_query_lock:
-		results = await _query_login_balances(accounts, live)
-	for r in results:
-		if r.get('success'):
-			record_account_usage('agentrouter', r['name'], r['used'], r['quota'])
-	failed = sum(1 for r in results if not r.get('success'))
-	if failed:
-		print(f'[AGENTROUTER] 余额查询：{failed}/{len(results)} 个账号失败')
-	total_quota = sum(r['quota'] for r in results if r.get('success'))
-	total_used = sum(r['used'] for r in results if r.get('success'))
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total_quota': round(total_quota, 2),
-			'total_used': round(total_used, 2),
-			'account_count': len(results),
-			'success_count': len(results) - failed,
-		},
-	}
-
-
 # ========== AnyRouter（cookie）签到与续期接口 ==========
-
-
-@app.post('/api/anyrouter/checkin/start')
-async def anyrouter_checkin_start():
-	"""启动 AnyRouter cookie 账号签到（并发，数秒完成）"""
-	if anyrouter_checkin_state['running']:
-		return {'success': False, 'error': 'AnyRouter 签到已在运行中', 'status': _anyrouter_checkin_status_payload()}
-	accounts = load_cookie_accounts()
-	if not accounts:
-		return {'success': False, 'error': '没有 cookie 账号可签到'}
-	start_anyrouter_checkin(trigger='manual')
-	await asyncio.sleep(0.2)
-	return {
-		'success': True,
-		'message': f'AnyRouter 签到已启动，共 {len(accounts)} 个账号',
-		'status': _anyrouter_checkin_status_payload(),
-	}
-
-
-@app.get('/api/anyrouter/checkin/status')
-async def anyrouter_checkin_status():
-	"""获取 AnyRouter 签到进度状态"""
-	return {'success': True, 'status': _anyrouter_checkin_status_payload()}
-
-
-@app.get('/api/anyrouter/cookie-status')
-async def anyrouter_cookie_status():
-	"""返回每个 cookie 账号 session 的过期时间与剩余天数"""
-	accounts = load_cookie_accounts()
-	items = []
-	for a in accounts:
-		info = _session_expiry_info(a.cookies.get('session', '')) or {}
-		items.append({
-			'name': a.name,
-			'api_user': a.api_user,
-			'expires_at': info.get('expires_at'),
-			'days_left': info.get('days_left'),
-		})
-	return {'success': True, 'accounts': items}
-
-
-@app.post('/api/anyrouter/renew')
-async def anyrouter_renew(req: dict | None = None):
-	"""续期 AnyRouter cookie 账号的 session（+30 天）。
-
-	可传 {"names": [...]} 指定账号，不传则续期全部 cookie 账号。
-	续期成功的新 session 会写回 saved_config.json。
-
-	一旦某个账号撞上 ESA 的 IP 限流就中止后续账号：限的是出口 IP，剩下的账号必然同样失败，
-	白打几十个请求还可能把限流窗口续上（计数器是否随新请求延长未实测，但没有理由去试）。
-	实测触发后至少半小时内所有 anyrouter 功能全废。
-	"""
-	accounts = load_cookie_accounts()
-	if not accounts:
-		return {'success': False, 'error': '没有 cookie 账号'}
-	if req and req.get('names'):
-		wanted = set(req['names'])
-		accounts = [a for a in accounts if a.name in wanted]
-		if not accounts:
-			return {'success': False, 'error': '指定的账号不存在'}
-
-	waf_cookies = await _get_waf_cookies_if_needed()
-	if not waf_cookies:
-		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
-
-	sem = asyncio.Semaphore(ANYROUTER_CONCURRENCY)
-	ratelimited = asyncio.Event()
-
-	def _skipped(name: str) -> dict:
-		return {'name': name, 'success': False, 'message': '已跳过：站点正在限流，本轮提前中止', 'skipped': True}
-
-	async def _limited(a):
-		if ratelimited.is_set():
-			return _skipped(a.name)
-		async with sem:
-			# 再判一次：排队等信号量的这段时间里，前面的账号可能已经撞上限流
-			if ratelimited.is_set():
-				return _skipped(a.name)
-			r = await renew_one_cookie(a, waf_cookies)
-		if r.get('blocked') == 'ratelimit':
-			ratelimited.set()
-		return r
-
-	results = await asyncio.gather(*[_limited(a) for a in accounts])
-	# 写回续期成功的新 session
-	updates = {r['name']: r['new_session'] for r in results if r.get('success') and r.get('new_session')}
-	save_renewed_sessions(updates)
-	# 返回时剔除敏感的 new_session 字段
-	clean = [{k: v for k, v in r.items() if k != 'new_session'} for r in results]
-	skipped = sum(1 for r in results if r.get('skipped'))
-	payload = {
-		'success': True,
-		'results': clean,
-		'summary': {
-			'total': len(results),
-			'renewed': sum(1 for r in results if r.get('success')),
-			'failed': sum(1 for r in results if not r.get('success')),
-			'skipped': skipped,
-		},
-	}
-	if ratelimited.is_set():
-		payload['notice'] = (
-			f'站点限流已触发，本轮中止（跳过 {skipped} 个账号）。这是按出口 IP 的临时封禁，'
-			'期间余额查询与签到也会失败。请隔一段时间再点续期 —— 反复重试会让封禁持续更久。'
-		)
-	return payload
 
 
 # ========== 通用 new-api 站点接口 ==========
 # 路径里的 {site_id} 对应 newapi_sites.json 里的 id。加站点不需要新增路由。
-
-
-def _site_or_error(site_id: str) -> tuple[NewapiSite | None, dict | None]:
-	"""取站点配置，找不到时返回统一的错误体"""
-	site = get_newapi_site(site_id)
-	if site is None:
-		return None, {'success': False, 'error': f'站点 {site_id} 不存在'}
-	return site, None
 
 
 @app.get('/api/sites')
@@ -1511,269 +1043,6 @@ async def collect_token(req: CollectRequest, request: Request):
 		'success': True,
 		'message': f'{site.label} 账号 {name} 已更新（{"覆盖" if replaced else "新增"}）',
 	}
-
-
-@app.post('/api/sites')
-async def save_sites(req: dict):
-	"""保存站点清单。前端「站点管理」用它增删改站点，后端无需改代码即可支持新站点。
-
-	删除站点时保留其账号文件与签到状态文件，避免误删后账号丢失（重新添加同 id 即可恢复）。
-	"""
-	try:
-		raw = req.get('sites', [])
-		validated = [NewapiSite(**s) for s in raw]
-		ids = [s.id for s in validated]
-		if len(set(ids)) != len(ids):
-			return {'success': False, 'error': '站点 id 重复'}
-		for s in validated:
-			if not s.id.replace('_', '').replace('-', '').isalnum():
-				return {'success': False, 'error': f'站点 id 只能用字母数字与 -_：{s.id}'}
-			if not s.domain.startswith('http'):
-				return {'success': False, 'error': f'域名要带 http(s)://：{s.domain}'}
-			s.domain = s.domain.rstrip('/')
-		save_newapi_sites(validated)
-		return {'success': True, 'sites': [s.model_dump() for s in validated]}
-	except Exception as e:
-		return {'success': False, 'error': str(e)}
-
-
-@app.post('/api/sites/probe')
-async def probe_site(req: dict):
-	"""探测一个域名是否是 new-api 站点，供前端在添加前确认域名填对了。
-
-	读 `GET /api/status`：能返回 `data.version` 就是 new-api，顺带把站点名、签到是否开启、
-	Turnstile 状态、quota 换算单位一并回给前端做默认值。此接口不写任何文件。
-	"""
-	domain = (req.get('domain') or '').strip().rstrip('/')
-	if not domain.startswith('http'):
-		return {'success': False, 'error': '域名要带 http(s)://'}
-	probe = NewapiSite(id='__probe__', label='probe', domain=domain)
-	try:
-		resp = await newapi_request(probe, 'GET', probe.status_path, {'User-Agent': USER_AGENT})
-	except Exception as e:
-		return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
-	if resp.status_code != 200:
-		return {'success': False, 'error': f'HTTP {resp.status_code}'}
-	try:
-		data = (resp.json() or {}).get('data', {}) or {}
-	except Exception:
-		return {'success': False, 'error': '返回的不是 JSON，可能不是 new-api 站点'}
-	if not data.get('version'):
-		return {'success': False, 'error': '未识别为 new-api 站点（/api/status 里没有 version）'}
-	page = await probe_page_protection(domain)
-	return {
-		'success': True,
-		'info': {
-			'version': data.get('version'),
-			'system_name': data.get('system_name') or '',
-			'checkin_enabled': bool(data.get('checkin_enabled')),
-			'turnstile_check': bool(data.get('turnstile_check')),
-			'quota_per_unit': data.get('quota_per_unit') or NEWAPI_DEFAULTS['quota_per_unit'],
-			'protections': {
-				'cf_challenge': bool(page.get('cf_challenge')),
-				'aliyun_waf': bool(page.get('aliyun_waf')),
-			},
-		},
-	}
-
-
-@app.get('/api/site/{site_id}/accounts')
-async def get_site_accounts(site_id: str):
-	"""获取某站点的账号列表"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	return {'success': True, 'accounts': [a.model_dump() for a in load_newapi_accounts(site)]}
-
-
-@app.post('/api/site/{site_id}/accounts')
-async def post_site_accounts(site_id: str, req: dict):
-	"""保存某站点的账号列表"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	try:
-		validated = [NewapiAccountItem(**acc) for acc in req.get('accounts', [])]
-		save_newapi_accounts(site, validated)
-		return {'success': True}
-	except Exception as e:
-		return {'success': False, 'error': str(e)}
-
-
-@app.post('/api/site/{site_id}/query')
-async def query_site(site_id: str):
-	"""批量查询某站点账号余额（并发，无 WAF/代理依赖）"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	accounts = load_newapi_accounts(site)
-	if not accounts:
-		return {'success': False, 'error': f'没有 {site.label} 账号'}
-
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
-
-	async def _limited(a):
-		async with sem:
-			return await query_balance_newapi(site, a)
-
-	results = await asyncio.gather(*[_limited(a) for a in accounts])
-	ok = [r for r in results if r.get('success')]
-	if ok:
-		_set_site_status(site.id, 'ok', '')
-	else:
-		errors = '; '.join(str(r.get('error', ''))[:60] for r in results if not r.get('success'))
-		_set_site_status(site.id, 'invalid', errors[:200])
-	return {
-		'success': True,
-		'results': results,
-		'summary': {
-			'total_quota': round(sum(r['quota'] for r in ok), 2),
-			'total_used': round(sum(r['used'] for r in ok), 2),
-			'account_count': len(results),
-			'success_count': len(ok),
-		},
-	}
-
-
-@app.post('/api/site/{site_id}/checkin/start')
-async def site_checkin_start(site_id: str):
-	"""启动某站点的账号签到（并发，数秒完成）"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	st = newapi_state(site)
-	if st['running']:
-		return {'success': False, 'error': f'{site.label} 签到已在运行中', 'status': _newapi_checkin_status_payload(site)}
-	accounts = load_newapi_accounts(site)
-	if not accounts:
-		return {'success': False, 'error': f'没有 {site.label} 账号可签到'}
-	start_newapi_checkin(site, trigger='manual')
-	await asyncio.sleep(0.2)
-	return {
-		'success': True,
-		'message': f'{site.label} 签到已启动，共 {len(accounts)} 个账号',
-		'status': _newapi_checkin_status_payload(site),
-	}
-
-
-@app.get('/api/site/{site_id}/turnstile')
-async def site_turnstile(site_id: str):
-	"""返回某站点当前的 Turnstile 状态，供前端决定签到走哪条路。
-
-	enabled=True  → 服务器端要带 token 才签得了：配置了打码平台就自动求解，
-	                没配置则前端展示浏览器脚本 + 同步流程
-	enabled=False → 站长关掉了校验，前端直接走 /checkin/start 一键签到
-	"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	return {'success': True, 'turnstile': await newapi_turnstile_status(site)}
-
-
-@app.get('/api/site/{site_id}/checkin/status')
-async def site_checkin_status(site_id: str):
-	"""获取某站点的签到进度状态"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	return {'success': True, 'status': _newapi_checkin_status_payload(site)}
-
-
-@app.post('/api/site/{site_id}/checkin/sync')
-async def site_checkin_sync(site_id: str):
-	"""在浏览器脚本签完之后，从站点核对每个账号的真实签到状态。
-
-	`GET /api/user/checkin` 没有挂 Turnstile 中间件（只有 POST 挂了，见 new-api 的
-	router/api-router.go），所以服务器随时能读到 `stats.checked_in_today`。用它核对，
-	就不需要浏览器脚本把结果回传 —— 脚本跑在站点的 HTTPS 页面上，受混合内容策略
-	限制本来也无法 fetch 回 HTTP 的本服务。
-
-	顺便查一次余额写入今日快照，与 run_newapi_checkin 的口径保持一致。
-	"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	accounts = load_newapi_accounts(site)
-	if not accounts:
-		return {'success': False, 'error': f'没有 {site.label} 账号'}
-
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
-	results: dict = {}
-
-	async def _one(acc: NewapiAccountItem):
-		async with sem:
-			info = await newapi_checkin_info(site, acc)
-			bal = await query_balance_newapi(site, acc)
-		if bal.get('success'):
-			record_account_usage(site.id, acc.name, bal['used'], bal['quota'])
-		if not info.get('success'):
-			results[acc.name] = {'name': acc.name, 'success': False, 'message': info.get('error', '状态查询失败')}
-			return
-		checked = bool(info.get('checked_in_today'))
-		results[acc.name] = {
-			'name': acc.name,
-			'success': checked,
-			'message': '今日已签到' if checked else '今日未签到',
-			'already_signed': checked,
-			'total_checkins': info.get('total_checkins'),
-			'quota': bal.get('quota') if bal.get('success') else None,
-			'used': bal.get('used') if bal.get('success') else None,
-		}
-
-	await asyncio.gather(*[_one(a) for a in accounts])
-
-	ordered = [results[a.name] for a in accounts if a.name in results]
-	now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-	st = newapi_state(site)
-	st['running'] = False
-	st['date'] = datetime.now().strftime('%Y-%m-%d')
-	st['trigger'] = 'browser'
-	st['started_at'] = st.get('started_at') or now_str
-	st['finished_at'] = now_str
-	st['total'] = len(ordered)
-	st['accounts'] = {}
-	st['logs'] = []
-	for r in ordered:
-		st['accounts'][r['name']] = {
-			'status': 'already' if r['success'] else 'failed',
-			'message': r['message'],
-			'time': now_str,
-		}
-		add_newapi_checkin_log(site, f'{r["name"]}: {r["message"]}')
-	signed = sum(1 for r in ordered if r['success'])
-	st['signed'] = 0
-	st['already'] = signed
-	st['failed'] = len(ordered) - signed
-	add_newapi_checkin_log(site, f'状态同步完成：已签到 {signed} / {len(ordered)}')
-	save_newapi_checkin_state(site)
-
-	return {
-		'success': True,
-		'results': ordered,
-		'checked_in': signed,
-		'total': len(ordered),
-		'status': _newapi_checkin_status_payload(site),
-	}
-
-
-@app.get('/api/site/{site_id}/checkin/info')
-async def site_checkin_info_all(site_id: str):
-	"""读取某站点各账号的签到状态与奖励区间（不触发签到）"""
-	site, err = _site_or_error(site_id)
-	if err:
-		return err
-	accounts = load_newapi_accounts(site)
-	if not accounts:
-		return {'success': False, 'error': f'没有 {site.label} 账号'}
-
-	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
-
-	async def _limited(a):
-		async with sem:
-			return await newapi_checkin_info(site, a)
-
-	results = await asyncio.gather(*[_limited(a) for a in accounts])
-	return {'success': True, 'accounts': results}
 
 
 # ========== 密钥管理（new-api 的「令牌」/api/token/） ==========
@@ -1964,47 +1233,6 @@ async def probe_tcp(host: str, port: int, timeout: float = 2.0) -> bool:
 		return True
 	except Exception:
 		return False
-
-
-@app.get('/api/system/proxy-info')
-async def get_proxy_info(probe: bool = False):
-	"""只读展示代理相关配置，供前端「设置」页做诊断。
-
-	这些值来自环境变量 / .env，前端改不了（改完要重启服务），所以纯只读。
-	之所以值得暴露：访问 anyrouter / agentrouter 必须走本地代理，代理没起来时
-	表现为一句藏在服务端日志里的 `[WAF] Failed to connect to 127.0.0.1:7890`，
-	用户在界面上完全看不到，只会觉得"查询莫名其妙失败"。
-
-	带 ?probe=true 时会实际连一下代理端口确认是否在跑。
-	"""
-	source = 'default'
-	if os.environ.get('HTTPS_PROXY'):
-		source = 'HTTPS_PROXY'
-	elif os.environ.get('HTTP_PROXY'):
-		source = 'HTTP_PROXY'
-
-	reachable = None
-	if probe:
-		parsed = urlparse(_PROXY)
-		if parsed.hostname and parsed.port:
-			reachable = await probe_tcp(parsed.hostname, parsed.port)
-
-	return {
-		'success': True,
-		'proxy': {
-			'url': mask_proxy_url(_PROXY),
-			'source': source,
-			'has_credentials': '@' in _PROXY.split('://', 1)[-1].split('/', 1)[0],
-			'reachable': reachable,
-		},
-		'mihomo': {
-			'group': MIHOMO_GROUP,
-			# 组名为空时不做出口轮换，是有意的安全降级而非故障
-			'rotation_enabled': bool(MIHOMO_GROUP),
-			'config_path': str(MIHOMO_CONFIG_FILE),
-			'config_exists': await asyncio.to_thread(MIHOMO_CONFIG_FILE.is_file),
-		},
-	}
 
 
 # ── 前端静态资源与 SPA 路由回退 ──────────────────────────────────────────────

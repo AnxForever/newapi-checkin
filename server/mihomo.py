@@ -13,6 +13,9 @@ import asyncio
 import re
 import time
 from urllib.parse import quote
+from fastapi import APIRouter
+
+mihomo_router = APIRouter()
 
 
 def _ar_session_key(base: str) -> str:
@@ -298,3 +301,49 @@ class _KeysExitRotator(_MihomoGroupSwitcher):
 				self.tried_ips.add(ip)
 			return True
 		return False
+
+
+# ===== 端点（块E 自 balance_server.py 迁入，晚绑定 bs.<名字>）=====
+
+@mihomo_router.get('/api/system/proxy-info')
+async def get_proxy_info(probe: bool = False):
+	import balance_server as bs
+	"""只读展示代理相关配置，供前端「设置」页做诊断。
+
+	这些值来自环境变量 / .env，前端改不了（改完要重启服务），所以纯只读。
+	之所以值得暴露：访问 anyrouter / agentrouter 必须走本地代理，代理没起来时
+	表现为一句藏在服务端日志里的 `[WAF] Failed to connect to 127.0.0.1:7890`，
+	用户在界面上完全看不到，只会觉得"查询莫名其妙失败"。
+
+	带 ?probe=true 时会实际连一下代理端口确认是否在跑。
+	"""
+	source = 'default'
+	if os.environ.get('HTTPS_PROXY'):
+		source = 'HTTPS_PROXY'
+	elif os.environ.get('HTTP_PROXY'):
+		source = 'HTTP_PROXY'
+
+	reachable = None
+	if probe:
+		parsed = urlparse(_PROXY)
+		if parsed.hostname and parsed.port:
+			reachable = await probe_tcp(parsed.hostname, parsed.port)
+
+	return {
+		'success': True,
+		'proxy': {
+			'url': mask_proxy_url(_PROXY),
+			'source': source,
+			'has_credentials': '@' in _PROXY.split('://', 1)[-1].split('/', 1)[0],
+			'reachable': reachable,
+		},
+		'mihomo': {
+			'group': MIHOMO_GROUP,
+			# 组名为空时不做出口轮换，是有意的安全降级而非故障
+			'rotation_enabled': bool(MIHOMO_GROUP),
+			'config_path': str(MIHOMO_CONFIG_FILE),
+			'config_exists': await asyncio.to_thread(MIHOMO_CONFIG_FILE.is_file),
+		},
+	}
+
+

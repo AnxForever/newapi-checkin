@@ -16,6 +16,9 @@ from collections import deque
 from datetime import datetime
 
 from pydantic import BaseModel
+from fastapi import APIRouter
+
+agentrouter_router = APIRouter()
 
 _FATAL_LOGIN_MARKS = ('密码', '封禁', '限流', '429')
 
@@ -551,3 +554,286 @@ async def _sign_in_one(account: LoginAccountItem, force: bool) -> dict:
 	out = {'name': account.name, **r}
 	out['fatal'] = any(m in msg for m in _FATAL_LOGIN_MARKS)
 	return out
+
+
+# ===== 端点（块E 自 balance_server.py 迁入，晚绑定 bs.<名字>）=====
+
+@agentrouter_router.get('/api/login-accounts/accounts')
+async def get_login_accounts():
+	import balance_server as bs
+	"""获取 agentrouter_accounts.json 中的账号列表"""
+	accounts = bs.load_login_accounts()
+	return {'success': True, 'accounts': [acc.model_dump() for acc in accounts]}
+
+
+
+@agentrouter_router.post('/api/login-accounts/accounts')
+async def save_login_accounts(req: dict):
+	import balance_server as bs
+	"""保存登录方式账号列表"""
+	try:
+		raw_accounts = req.get('accounts', [])
+		validated = [LoginAccountItem(**acc) for acc in raw_accounts]
+		bs._atomic_write_json(AGENTROUTER_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
+		return {'success': True}
+	except Exception as e:
+		return {'success': False, 'error': str(e)}
+
+
+
+@agentrouter_router.post('/api/login-accounts/query')
+async def query_login_accounts():
+	import balance_server as bs
+	"""查询所有 agentrouter.org 账号余额"""
+	accounts = bs.load_login_accounts()
+	if not accounts:
+		return {'success': False, 'error': 'agentrouter_accounts.json 不存在或为空'}
+
+	# 登录接口有按 IP 限流，顺序处理并在账号之间加延迟以规避 429
+	results = []
+	for i, acc in enumerate(accounts):
+		if i > 0:
+			await asyncio.sleep(1.5)
+		results.append(await query_balance_login(acc))
+	total_quota = sum(r.get('quota', 0) for r in results if r.get('success'))
+	total_used = sum(r.get('used', 0) for r in results if r.get('success'))
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total_quota': round(total_quota, 2),
+			'total_used': round(total_used, 2),
+			'account_count': len(results),
+			'success_count': sum(1 for r in results if r.get('success')),
+		},
+	}
+
+
+
+@agentrouter_router.post('/api/login-accounts/checkin/fast')
+async def login_checkin_fast():
+	import balance_server as bs
+	"""一键全签：轮换出口 IP 分批登录（agentrouter 登录即签到），约 1~2 分钟跑完。
+
+	与 /checkin/start 的缓慢模式（账号间隔默认 30~60 分钟，可在设置里改）互补。
+	出口轮换是全局动作，与余额查询共用一把锁；今天已签到的账号直接跳过，省 WAF 配额。
+	"""
+	accounts = bs.load_login_accounts()
+	if not accounts:
+		return {'success': False, 'error': 'agentrouter_accounts.json 不存在或为空'}
+	if bs.checkin_state['running']:
+		return {'success': False, 'error': '签到流程正在运行（缓慢模式不可打断），请先停止或等它结束'}
+	if bs._balances_query_lock.locked():
+		return {'success': False, 'error': '已有一轮出口轮换任务（余额查询/全签到）在进行中，请等它结束再点'}
+
+	# 今天已签到的账号跳过：登录即签到，已签过再登一次既没意义又白耗 WAF 配额
+	today = datetime.now().strftime('%Y-%m-%d')
+	done_status: dict = {}
+	if bs.checkin_state.get('date') == today:
+		done_status = {
+			n: v
+			for n, v in (bs.checkin_state.get('accounts') or {}).items()
+			if v.get('status') in ('signed', 'already')
+		}
+	pending = [a for a in accounts if a.name not in done_status]
+
+	bs.checkin_state.update(
+		running=True,
+		date=today,
+		trigger='fast',
+		mode='fast',
+		started_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+		finished_at=None,
+		total=len(accounts),
+		done=len(done_status),
+		order=[a.name for a in accounts],
+		current=None,
+		next_at=None,
+		logs=[],
+	)
+	bs.checkin_state['accounts'] = {
+		a.name: done_status.get(a.name) or {'status': 'pending', 'message': '等待签到', 'time': None}
+		for a in accounts
+	}
+	add_checkin_log(f'一键全签开始（轮换出口）：{len(pending)} 个待签 / {len(done_status)} 个今日已签跳过')
+	save_checkin_state()
+
+	def _on_result(account, r):
+		ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+		if r.get('success'):
+			bs.checkin_state['accounts'][account.name] = {
+				'status': 'already' if r.get('already_signed') else 'signed',
+				'message': r.get('message', '签到成功'),
+				'time': ts,
+				'quota': r.get('quota'),
+				'used': r.get('used'),
+			}
+			# 登录响应顺带拿到的余额写进今日快照（quota 为 None 说明没取到，跳过记账）
+			if r.get('quota') is not None:
+				bs.record_account_usage('agentrouter', account.name, r.get('used', 0), r.get('quota', 0))
+			add_checkin_log(f'{account.name}: {r.get("message", "签到成功")}')
+		else:
+			msg = r.get('error') or r.get('message') or '签到失败'
+			bs.checkin_state['accounts'][account.name] = {'status': 'failed', 'message': msg, 'time': ts}
+			add_checkin_log(f'{account.name}: 签到失败 — {msg}')
+		bs.checkin_state['done'] = sum(
+			1 for v in bs.checkin_state['accounts'].values() if v.get('status') in ('signed', 'already', 'failed')
+		)
+		save_checkin_state()
+
+	results: list = []
+	aborted = False
+	if pending:
+		async with bs._balances_query_lock:
+			# 停止按钮置 running=False，轮换调度每轮开始前检查它 —— fast 模式从此可停
+			results, aborted = await bs._run_with_rotation(
+				pending, bs._sign_in_one, on_result=_on_result, should_stop=lambda: not bs.checkin_state['running']
+			)
+	else:
+		add_checkin_log('全部账号今日都已签到，无需签到')
+
+	stopped = not bs.checkin_state['running']  # 停止按钮已把 running 置 False
+	bs.checkin_state['running'] = False
+	bs.checkin_state['finished_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+	signed = sum(1 for v in bs.checkin_state['accounts'].values() if v.get('status') in ('signed', 'already'))
+	failed = sum(1 for v in bs.checkin_state['accounts'].values() if v.get('status') == 'failed')
+	add_checkin_log(
+		f'一键全签结束：{signed}/{bs.checkin_state["total"]} 已签到，失败 {failed}'
+		+ ('（WAF 惩罚期提前中止）' if aborted else '')
+		+ ('（手动停止）' if stopped else '')
+	)
+	save_checkin_state()
+	return {
+		'success': True,
+		'summary': {
+			'total': len(accounts),
+			'new_signed': sum(1 for r in results if r.get('success') and not r.get('already_signed')),
+			'already': sum(1 for r in results if r.get('already_signed')) + len(done_status),
+			'failed': failed,
+			'aborted': aborted,
+		},
+		'status': bs._checkin_status_payload(),
+	}
+
+
+
+@agentrouter_router.post('/api/login-accounts/checkin/start')
+async def login_checkin_start():
+	import balance_server as bs
+	"""启动 Login 账号签到流程（随机顺序、账号间随机等待 30~60 分钟）"""
+	if bs.checkin_state['running']:
+		return {'success': False, 'error': '签到流程已在运行中', 'status': bs._checkin_status_payload()}
+	accounts = bs.load_login_accounts()
+	if not accounts:
+		return {'success': False, 'error': 'agentrouter_accounts.json 不存在或为空'}
+	bs.start_login_checkin(trigger='manual')
+	# 稍等片刻让任务初始化状态
+	await asyncio.sleep(0.2)
+	return {'success': True, 'message': f'签到流程已启动，共 {len(accounts)} 个账号', 'status': bs._checkin_status_payload()}
+
+
+
+@agentrouter_router.post('/api/login-accounts/checkin/stop')
+async def login_checkin_stop():
+	import balance_server as bs
+	"""停止正在运行的 Login 账号签到流程"""
+	if not bs.checkin_state['running']:
+		return {'success': False, 'error': '当前没有正在运行的签到流程'}
+	bs.checkin_state['running'] = False
+	add_checkin_log('收到停止指令')
+	return {'success': True, 'message': '已发送停止指令'}
+
+
+
+def _checkin_status_payload() -> dict:
+	"""组装签到状态返回体"""
+	import balance_server as bs
+
+	accounts = [
+		{
+			'name': name,
+			'status': info.get('status', 'pending'),
+			'message': info.get('message', ''),
+			'time': info.get('time'),
+			'quota': info.get('quota'),
+			'used': info.get('used'),
+		}
+		for name, info in bs.checkin_state['accounts'].items()
+	]
+	# 按本轮随机顺序排序，便于前端展示进度
+	order_index = {n: i for i, n in enumerate(bs.checkin_state['order'])}
+	accounts.sort(key=lambda a: order_index.get(a['name'], 999))
+	signed = sum(1 for a in accounts if a['status'] in ('signed', 'already'))
+	failed = sum(1 for a in accounts if a['status'] == 'failed')
+	# done = 已到达终态（成功/今日已签/最终失败）的账号数；pending（含待重试）不计
+	done = signed + failed
+	return {
+		'running': bs.checkin_state['running'],
+		'date': bs.checkin_state['date'],
+		'trigger': bs.checkin_state['trigger'],
+		'mode': bs.checkin_state.get('mode') or 'slow',
+		'started_at': bs.checkin_state['started_at'],
+		'finished_at': bs.checkin_state['finished_at'],
+		'total': bs.checkin_state['total'],
+		'done': done,
+		'signed': signed,
+		'failed': failed,
+		'accounts': accounts,
+		'logs': bs.checkin_state['logs'][-30:],
+	}
+
+
+@agentrouter_router.get('/api/login-accounts/checkin/status')
+async def login_checkin_status():
+	import balance_server as bs
+	"""获取 Login 账号签到流程的进度状态"""
+	return {'success': True, 'status': bs._checkin_status_payload()}
+
+
+
+@agentrouter_router.get('/api/login-accounts/balances')
+async def login_accounts_balances(live: bool = False, names: str = ''):
+	import balance_server as bs
+	"""返回每个 agentrouter（Login）账号的余额。
+
+	复用缓存 session 只打 /api/user/self；`live=true` 强制全部重登；`names=a,b` 只查指定账号
+	（按名字精确匹配，逗号分隔）。结果写进今日快照当基线，今日用量从第二次查询起就能算出来。
+
+	因为 WAF 按出口 IP + cookie 拦截（见 ExitRotator 的注释），这里不能全量并发：
+	bs._query_login_balances 分批轮换出口 IP，一轮全量约 1~2 分钟。轮换是全局动作，
+	同一时刻只允许一轮查询（重复点击会收到「查询进行中」）。
+	"""
+	accounts = bs.load_login_accounts()
+	if names:
+		wanted = {n.strip() for n in names.split(',') if n.strip()}
+		accounts = [a for a in accounts if a.name in wanted]
+	if not accounts:
+		return {
+			'success': True,
+			'results': [],
+			'summary': {'total_quota': 0, 'total_used': 0, 'account_count': 0, 'success_count': 0},
+		}
+	if bs._balances_query_lock.locked():
+		return {'success': False, 'error': '已有一轮 AgentRouter 查询在进行中（要轮换出口 IP，必须独占），请等它结束再点'}
+	async with bs._balances_query_lock:
+		results = await bs._query_login_balances(accounts, live)
+	for r in results:
+		if r.get('success'):
+			bs.record_account_usage('agentrouter', r['name'], r['used'], r['quota'])
+	failed = sum(1 for r in results if not r.get('success'))
+	if failed:
+		print(f'[AGENTROUTER] 余额查询：{failed}/{len(results)} 个账号失败')
+	total_quota = sum(r['quota'] for r in results if r.get('success'))
+	total_used = sum(r['used'] for r in results if r.get('success'))
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total_quota': round(total_quota, 2),
+			'total_used': round(total_used, 2),
+			'account_count': len(results),
+			'success_count': len(results) - failed,
+		},
+	}
+
+

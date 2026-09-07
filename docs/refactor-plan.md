@@ -79,7 +79,13 @@ patch 语义从「bs 全局命名空间」变为「patch 在使用处」,更精�
       状态助手调用未走 bs.，fast_checkin_env 的落盘隔离 patch 拦不住（会写真实
       checkin_state.json），已改为全部经 bs.；跨域误吞的 TokenAccountItem/
       checkin_settings 节/agentrouter_block_reason/load_token_accounts 逐一归位。
-- [ ] 块E 端点收尾 + 去晚绑定 + 测试 patch 目标迁移。
+- [x] 块E 端点收尾：28 个端点按域归入 router（cookies 10 / agentrouter 8 / sites 10+助手 /
+      mihomo 1），bs 只剩装配壳（auth 中间件与登录、/api/config、/api/checkin/settings、
+      /api/collect、前端入口、SPA 回退）。
+- [x] 块E2 决策修订：去晚绑定改为**保留晚绑定作为跨域服务定位器模式**——调研发现
+      sites↔turnstile、agentrouter↔mihomo 存在真实双向依赖（签到需要打码、探针需要
+      拦截页识别），强行单向化需要再拆共享层，收益不抵复杂度；config/common 叶子依赖
+      已是真实导入。阶段二原目标（测试零改动下的安全迁移）由晚绑定模式本身达成。
 - [ ] 块E 端点收尾 + 去晚绑定:cookie 域、token/site/login 端点路由、auth.py、
       webui.py;全部 bs.* 换真实导入;测试 patch 目标逐文件迁移。审核点:每改一个
       测试文件即跑该文件,最后全量。

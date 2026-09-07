@@ -40,6 +40,22 @@ class AccountItem(BaseModel):
 	cookies: dict
 	api_user: str
 
+class QueryRequest(BaseModel):
+	accounts: list[AccountItem]
+
+
+class TokenAccountItem(BaseModel):
+	"""传统 access_token 方式（new_accounts_config.json）—— cookies 域内查询/签到用"""
+	name: str
+	access_token: str
+	user_id: str
+
+
+class TokenQueryRequest(BaseModel):
+	accounts: list[TokenAccountItem]
+
+
+
 
 def _api_url(path: str) -> str:
 	"""返回 API 地址"""
@@ -569,3 +585,294 @@ def start_anyrouter_checkin(trigger: str = 'manual') -> bool:
 		return False
 	bs.anyrouter_checkin_state['task'] = asyncio.create_task(run_anyrouter_checkin(trigger))
 	return True
+
+
+# ===== 端点（块E 自 balance_server.py 迁入，晚绑定 bs.<名字>）=====
+
+@cookies_router.post('/api/query')
+async def query(req: QueryRequest):
+	import balance_server as bs
+	"""批量查询账号余额"""
+	waf_cookies = await bs._get_waf_cookies_if_needed()
+	if not waf_cookies :
+		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
+
+	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
+
+	async def limited_query(acc):
+		async with sem:
+			return await bs.query_balance(acc, waf_cookies)
+
+	tasks = [limited_query(acc) for acc in req.accounts]
+	results = await asyncio.gather(*tasks)
+
+	total_quota = sum(r.get('quota', 0) for r in results if r.get('success'))
+	total_used = sum(r.get('used', 0) for r in results if r.get('success'))
+
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total_quota': round(total_quota, 2),
+			'total_used': round(total_used, 2),
+			'account_count': len(results),
+			'success_count': sum(1 for r in results if r.get('success')),
+		},
+	}
+
+
+
+@cookies_router.post('/api/checkin')
+async def checkin(req: QueryRequest):
+	import balance_server as bs
+	"""批量签到"""
+	waf_cookies = await bs._get_waf_cookies_if_needed()
+	if not waf_cookies :
+		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
+
+	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
+
+	async def limited_sign_in(acc):
+		async with sem:
+			return await bs.sign_in(acc, waf_cookies)
+
+	tasks = [limited_sign_in(acc) for acc in req.accounts]
+	results = await asyncio.gather(*tasks)
+
+	success_count = sum(1 for r in results if r.get('success'))
+	new_sign_count = sum(1 for r in results if r.get('success') and not r.get('already_signed'))
+
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total': len(results),
+			'success': success_count,
+			'new_signed': new_sign_count,
+		},
+	}
+
+
+
+@cookies_router.get('/api/token/accounts')
+async def get_token_accounts():
+	import balance_server as bs
+	"""获取 new_accounts_config.json 中的账号列表（含完整信息，用于管理）"""
+	accounts = bs.load_token_accounts()
+	return {
+		'success': True,
+		'accounts': [acc.model_dump() for acc in accounts],
+	}
+
+
+
+@cookies_router.post('/api/token/accounts')
+async def save_token_accounts(req: dict):
+	import balance_server as bs
+	"""保存 token 账号列表到 new_accounts_config.json"""
+	try:
+		raw_accounts = req.get('accounts', [])
+		validated = [bs.TokenAccountItem(**acc) for acc in raw_accounts]
+		bs._atomic_write_json(NEW_ACCOUNTS_FILE, [acc.model_dump() for acc in validated], indent=2)
+		return {'success': True}
+	except Exception as e:
+		return {'success': False, 'error': str(e)}
+
+
+
+@cookies_router.post('/api/token/query')
+async def query_with_token(req: TokenQueryRequest | None = None):
+	import balance_server as bs
+	"""使用 access_token 批量查询账号余额
+	如果不传 accounts，则从 new_accounts_config.json 读取
+	"""
+	if req and req.accounts:
+		accounts = req.accounts
+	else:
+		accounts = bs.load_token_accounts()
+		if not accounts:
+			return {'success': False, 'error': 'new_accounts_config.json 不存在或为空'}
+
+	waf_cookies = await bs._get_waf_cookies_if_needed()
+	if not waf_cookies :
+		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
+
+	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
+
+	async def limited_query(acc):
+		async with sem:
+			return await bs.query_balance_with_token(acc, waf_cookies)
+
+	tasks = [limited_query(acc) for acc in accounts]
+	results = await asyncio.gather(*tasks)
+
+	total_quota = sum(r.get('quota', 0) for r in results if r.get('success'))
+	total_used = sum(r.get('used', 0) for r in results if r.get('success'))
+
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total_quota': round(total_quota, 2),
+			'total_used': round(total_used, 2),
+			'account_count': len(results),
+			'success_count': sum(1 for r in results if r.get('success')),
+		},
+	}
+
+
+
+@cookies_router.post('/api/token/checkin')
+async def checkin_with_token(req: TokenQueryRequest | None = None):
+	import balance_server as bs
+	"""使用 access_token 批量签到
+	如果不传 accounts，则从 new_accounts_config.json 读取
+	"""
+	if req and req.accounts:
+		accounts = req.accounts
+	else:
+		accounts = bs.load_token_accounts()
+		if not accounts:
+			return {'success': False, 'error': 'new_accounts_config.json 不存在或为空'}
+
+	waf_cookies = await bs._get_waf_cookies_if_needed()
+	if not waf_cookies :
+		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
+
+	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
+
+	async def limited_sign_in(acc):
+		async with sem:
+			return await sign_in_with_token(acc, waf_cookies)
+
+	tasks = [limited_sign_in(acc) for acc in accounts]
+	results = await asyncio.gather(*tasks)
+
+	success_count = sum(1 for r in results if r.get('success'))
+	new_sign_count = sum(1 for r in results if r.get('success') and not r.get('already_signed'))
+
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total': len(results),
+			'success': success_count,
+			'new_signed': new_sign_count,
+		},
+	}
+
+
+
+@cookies_router.post('/api/anyrouter/checkin/start')
+async def anyrouter_checkin_start():
+	import balance_server as bs
+	"""启动 AnyRouter cookie 账号签到（并发，数秒完成）"""
+	if bs.anyrouter_checkin_state['running']:
+		return {'success': False, 'error': 'AnyRouter 签到已在运行中', 'status': _anyrouter_checkin_status_payload()}
+	accounts = bs.load_cookie_accounts()
+	if not accounts:
+		return {'success': False, 'error': '没有 cookie 账号可签到'}
+	bs.start_anyrouter_checkin(trigger='manual')
+	await asyncio.sleep(0.2)
+	return {
+		'success': True,
+		'message': f'AnyRouter 签到已启动，共 {len(accounts)} 个账号',
+		'status': _anyrouter_checkin_status_payload(),
+	}
+
+
+
+@cookies_router.get('/api/anyrouter/checkin/status')
+async def anyrouter_checkin_status():
+	import balance_server as bs
+	"""获取 AnyRouter 签到进度状态"""
+	return {'success': True, 'status': _anyrouter_checkin_status_payload()}
+
+
+
+@cookies_router.get('/api/anyrouter/cookie-status')
+async def anyrouter_cookie_status():
+	import balance_server as bs
+	"""返回每个 cookie 账号 session 的过期时间与剩余天数"""
+	accounts = bs.load_cookie_accounts()
+	items = []
+	for a in accounts:
+		info = bs._session_expiry_info(a.cookies.get('session', '')) or {}
+		items.append({
+			'name': a.name,
+			'api_user': a.api_user,
+			'expires_at': info.get('expires_at'),
+			'days_left': info.get('days_left'),
+		})
+	return {'success': True, 'accounts': items}
+
+
+
+@cookies_router.post('/api/anyrouter/renew')
+async def anyrouter_renew(req: dict | None = None):
+	import balance_server as bs
+	"""续期 AnyRouter cookie 账号的 session（+30 天）。
+
+	可传 {"names": [...]} 指定账号，不传则续期全部 cookie 账号。
+	续期成功的新 session 会写回 saved_config.json。
+
+	一旦某个账号撞上 ESA 的 IP 限流就中止后续账号：限的是出口 IP，剩下的账号必然同样失败，
+	白打几十个请求还可能把限流窗口续上（计数器是否随新请求延长未实测，但没有理由去试）。
+	实测触发后至少半小时内所有 anyrouter 功能全废。
+	"""
+	accounts = bs.load_cookie_accounts()
+	if not accounts:
+		return {'success': False, 'error': '没有 cookie 账号'}
+	if req and req.get('names'):
+		wanted = set(req['names'])
+		accounts = [a for a in accounts if a.name in wanted]
+		if not accounts:
+			return {'success': False, 'error': '指定的账号不存在'}
+
+	waf_cookies = await bs._get_waf_cookies_if_needed()
+	if not waf_cookies:
+		return {'success': False, 'error': 'WAF cookies 获取失败，请稍后重试'}
+
+	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
+	ratelimited = asyncio.Event()
+
+	def _skipped(name: str) -> dict:
+		return {'name': name, 'success': False, 'message': '已跳过：站点正在限流，本轮提前中止', 'skipped': True}
+
+	async def _limited(a):
+		if ratelimited.is_set():
+			return _skipped(a.name)
+		async with sem:
+			# 再判一次：排队等信号量的这段时间里，前面的账号可能已经撞上限流
+			if ratelimited.is_set():
+				return _skipped(a.name)
+			r = await bs.renew_one_cookie(a, waf_cookies)
+		if r.get('blocked') == 'ratelimit':
+			ratelimited.set()
+		return r
+
+	results = await asyncio.gather(*[_limited(a) for a in accounts])
+	# 写回续期成功的新 session
+	updates = {r['name']: r['new_session'] for r in results if r.get('success') and r.get('new_session')}
+	bs.save_renewed_sessions(updates)
+	# 返回时剔除敏感的 new_session 字段
+	clean = [{k: v for k, v in r.items() if k != 'new_session'} for r in results]
+	skipped = sum(1 for r in results if r.get('skipped'))
+	payload = {
+		'success': True,
+		'results': clean,
+		'summary': {
+			'total': len(results),
+			'renewed': sum(1 for r in results if r.get('success')),
+			'failed': sum(1 for r in results if not r.get('success')),
+			'skipped': skipped,
+		},
+	}
+	if ratelimited.is_set():
+		payload['notice'] = (
+			f'站点限流已触发，本轮中止（跳过 {skipped} 个账号）。这是按出口 IP 的临时封禁，'
+			'期间余额查询与签到也会失败。请隔一段时间再点续期 —— 反复重试会让封禁持续更久。'
+		)
+	return payload
+
+

@@ -17,6 +17,9 @@ from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel
+from fastapi import APIRouter
+
+sites_router = APIRouter()
 
 NEWAPI_DEFAULTS = {
 	'user_info_path': '/api/user/self',
@@ -589,3 +592,299 @@ def _newapi_checkin_status_payload(site: NewapiSite) -> dict:
 		'accounts': accounts,
 		'logs': st['logs'][-30:],
 	}
+
+
+# ===== 端点（块E 自 balance_server.py 迁入，晚绑定 bs.<名字>）=====
+
+def _site_or_error(site_id: str):
+	import balance_server as bs
+	"""取站点配置，找不到时返回统一的错误体"""
+	site = bs.get_newapi_site(site_id)
+	if site is None:
+		return None, {'success': False, 'error': f'站点 {site_id} 不存在'}
+	return site, None
+
+
+
+@sites_router.post('/api/sites')
+async def save_sites(req: dict):
+	import balance_server as bs
+	"""保存站点清单。前端「站点管理」用它增删改站点，后端无需改代码即可支持新站点。
+
+	删除站点时保留其账号文件与签到状态文件，避免误删后账号丢失（重新添加同 id 即可恢复）。
+	"""
+	try:
+		raw = req.get('sites', [])
+		validated = [bs.NewapiSite(**s) for s in raw]
+		ids = [s.id for s in validated]
+		if len(set(ids)) != len(ids):
+			return {'success': False, 'error': '站点 id 重复'}
+		for s in validated:
+			if not s.id.replace('_', '').replace('-', '').isalnum():
+				return {'success': False, 'error': f'站点 id 只能用字母数字与 -_：{s.id}'}
+			if not s.domain.startswith('http'):
+				return {'success': False, 'error': f'域名要带 http(s)://：{s.domain}'}
+			s.domain = s.domain.rstrip('/')
+		bs.save_newapi_sites(validated)
+		return {'success': True, 'sites': [s.model_dump() for s in validated]}
+	except Exception as e:
+		return {'success': False, 'error': str(e)}
+
+
+
+@sites_router.post('/api/sites/probe')
+async def probe_site(req: dict):
+	import balance_server as bs
+	"""探测一个域名是否是 new-api 站点，供前端在添加前确认域名填对了。
+
+	读 `GET /api/status`：能返回 `data.version` 就是 new-api，顺带把站点名、签到是否开启、
+	Turnstile 状态、quota 换算单位一并回给前端做默认值。此接口不写任何文件。
+	"""
+	domain = (req.get('domain') or '').strip().rstrip('/')
+	if not domain.startswith('http'):
+		return {'success': False, 'error': '域名要带 http(s)://'}
+	probe = bs.NewapiSite(id='__probe__', label='probe', domain=domain)
+	try:
+		resp = await bs.newapi_request(probe, 'GET', probe.status_path, {'User-Agent': bs.USER_AGENT})
+	except Exception as e:
+		return {'success': False, 'error': f'{type(e).__name__}: {e}'[:150]}
+	if resp.status_code != 200:
+		return {'success': False, 'error': f'HTTP {resp.status_code}'}
+	try:
+		data = (resp.json() or {}).get('data', {}) or {}
+	except Exception:
+		return {'success': False, 'error': '返回的不是 JSON，可能不是 new-api 站点'}
+	if not data.get('version'):
+		return {'success': False, 'error': '未识别为 new-api 站点（/api/status 里没有 version）'}
+	page = await bs.probe_page_protection(domain)
+	return {
+		'success': True,
+		'info': {
+			'version': data.get('version'),
+			'system_name': data.get('system_name') or '',
+			'checkin_enabled': bool(data.get('checkin_enabled')),
+			'turnstile_check': bool(data.get('turnstile_check')),
+			'quota_per_unit': data.get('quota_per_unit') or bs.NEWAPI_DEFAULTS['quota_per_unit'],
+			'protections': {
+				'cf_challenge': bool(page.get('cf_challenge')),
+				'aliyun_waf': bool(page.get('aliyun_waf')),
+			},
+		},
+	}
+
+
+
+@sites_router.get('/api/site/{site_id}/accounts')
+async def get_site_accounts(site_id: str):
+	import balance_server as bs
+	"""获取某站点的账号列表"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	return {'success': True, 'accounts': [a.model_dump() for a in bs.load_newapi_accounts(site)]}
+
+
+
+@sites_router.post('/api/site/{site_id}/accounts')
+async def post_site_accounts(site_id: str, req: dict):
+	import balance_server as bs
+	"""保存某站点的账号列表"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	try:
+		validated = [bs.NewapiAccountItem(**acc) for acc in req.get('accounts', [])]
+		bs.save_newapi_accounts(site, validated)
+		return {'success': True}
+	except Exception as e:
+		return {'success': False, 'error': str(e)}
+
+
+
+@sites_router.post('/api/site/{site_id}/query')
+async def query_site(site_id: str):
+	import balance_server as bs
+	"""批量查询某站点账号余额（并发，无 WAF/代理依赖）"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	accounts = bs.load_newapi_accounts(site)
+	if not accounts:
+		return {'success': False, 'error': f'没有 {site.label} 账号'}
+
+	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+
+	async def _limited(a):
+		async with sem:
+			return await bs.query_balance_newapi(site, a)
+
+	results = await asyncio.gather(*[_limited(a) for a in accounts])
+	ok = [r for r in results if r.get('success')]
+	if ok:
+		bs._set_site_status(site.id, 'ok', '')
+	else:
+		errors = '; '.join(str(r.get('error', ''))[:60] for r in results if not r.get('success'))
+		bs._set_site_status(site.id, 'invalid', errors[:200])
+	return {
+		'success': True,
+		'results': results,
+		'summary': {
+			'total_quota': round(sum(r['quota'] for r in ok), 2),
+			'total_used': round(sum(r['used'] for r in ok), 2),
+			'account_count': len(results),
+			'success_count': len(ok),
+		},
+	}
+
+
+
+@sites_router.post('/api/site/{site_id}/checkin/start')
+async def site_checkin_start(site_id: str):
+	import balance_server as bs
+	"""启动某站点的账号签到（并发，数秒完成）"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	st = bs.newapi_state(site)
+	if st['running']:
+		return {'success': False, 'error': f'{site.label} 签到已在运行中', 'status': bs._newapi_checkin_status_payload(site)}
+	accounts = bs.load_newapi_accounts(site)
+	if not accounts:
+		return {'success': False, 'error': f'没有 {site.label} 账号可签到'}
+	bs.start_newapi_checkin(site, trigger='manual')
+	await asyncio.sleep(0.2)
+	return {
+		'success': True,
+		'message': f'{site.label} 签到已启动，共 {len(accounts)} 个账号',
+		'status': bs._newapi_checkin_status_payload(site),
+	}
+
+
+
+@sites_router.get('/api/site/{site_id}/turnstile')
+async def site_turnstile(site_id: str):
+	import balance_server as bs
+	"""返回某站点当前的 Turnstile 状态，供前端决定签到走哪条路。
+
+	enabled=True  → 服务器端要带 token 才签得了：配置了打码平台就自动求解，
+	                没配置则前端展示浏览器脚本 + 同步流程
+	enabled=False → 站长关掉了校验，前端直接走 /checkin/start 一键签到
+	"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	return {'success': True, 'turnstile': await bs.newapi_turnstile_status(site)}
+
+
+
+@sites_router.get('/api/site/{site_id}/checkin/status')
+async def site_checkin_status(site_id: str):
+	import balance_server as bs
+	"""获取某站点的签到进度状态"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	return {'success': True, 'status': bs._newapi_checkin_status_payload(site)}
+
+
+
+@sites_router.post('/api/site/{site_id}/checkin/sync')
+async def site_checkin_sync(site_id: str):
+	import balance_server as bs
+	"""在浏览器脚本签完之后，从站点核对每个账号的真实签到状态。
+
+	`GET /api/user/checkin` 没有挂 Turnstile 中间件（只有 POST 挂了，见 new-api 的
+	router/api-router.go），所以服务器随时能读到 `stats.checked_in_today`。用它核对，
+	就不需要浏览器脚本把结果回传 —— 脚本跑在站点的 HTTPS 页面上，受混合内容策略
+	限制本来也无法 fetch 回 HTTP 的本服务。
+
+	顺便查一次余额写入今日快照，与 bs.run_newapi_checkin 的口径保持一致。
+	"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	accounts = bs.load_newapi_accounts(site)
+	if not accounts:
+		return {'success': False, 'error': f'没有 {site.label} 账号'}
+
+	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+	results: dict = {}
+
+	async def _one(acc: bs.NewapiAccountItem):
+		async with sem:
+			info = await bs.newapi_checkin_info(site, acc)
+			bal = await bs.query_balance_newapi(site, acc)
+		if bal.get('success'):
+			bs.record_account_usage(site.id, acc.name, bal['used'], bal['quota'])
+		if not info.get('success'):
+			results[acc.name] = {'name': acc.name, 'success': False, 'message': info.get('error', '状态查询失败')}
+			return
+		checked = bool(info.get('checked_in_today'))
+		results[acc.name] = {
+			'name': acc.name,
+			'success': checked,
+			'message': '今日已签到' if checked else '今日未签到',
+			'already_signed': checked,
+			'total_checkins': info.get('total_checkins'),
+			'quota': bal.get('quota') if bal.get('success') else None,
+			'used': bal.get('used') if bal.get('success') else None,
+		}
+
+	await asyncio.gather(*[_one(a) for a in accounts])
+
+	ordered = [results[a.name] for a in accounts if a.name in results]
+	now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+	st = bs.newapi_state(site)
+	st['running'] = False
+	st['date'] = datetime.now().strftime('%Y-%m-%d')
+	st['trigger'] = 'browser'
+	st['started_at'] = st.get('started_at') or now_str
+	st['finished_at'] = now_str
+	st['total'] = len(ordered)
+	st['accounts'] = {}
+	st['logs'] = []
+	for r in ordered:
+		st['accounts'][r['name']] = {
+			'status': 'already' if r['success'] else 'failed',
+			'message': r['message'],
+			'time': now_str,
+		}
+		add_newapi_checkin_log(site, f'{r["name"]}: {r["message"]}')
+	signed = sum(1 for r in ordered if r['success'])
+	st['signed'] = 0
+	st['already'] = signed
+	st['failed'] = len(ordered) - signed
+	add_newapi_checkin_log(site, f'状态同步完成：已签到 {signed} / {len(ordered)}')
+	save_newapi_checkin_state(site)
+
+	return {
+		'success': True,
+		'results': ordered,
+		'checked_in': signed,
+		'total': len(ordered),
+		'status': bs._newapi_checkin_status_payload(site),
+	}
+
+
+
+@sites_router.get('/api/site/{site_id}/checkin/info')
+async def site_checkin_info_all(site_id: str):
+	import balance_server as bs
+	"""读取某站点各账号的签到状态与奖励区间（不触发签到）"""
+	site, err = bs._site_or_error(site_id)
+	if err:
+		return err
+	accounts = bs.load_newapi_accounts(site)
+	if not accounts:
+		return {'success': False, 'error': f'没有 {site.label} 账号'}
+
+	sem = asyncio.Semaphore(site.concurrency or NEWAPI_CONCURRENCY)
+
+	async def _limited(a):
+		async with sem:
+			return await bs.newapi_checkin_info(site, a)
+
+	results = await asyncio.gather(*[_limited(a) for a in accounts])
+	return {'success': True, 'accounts': results}
+
+
