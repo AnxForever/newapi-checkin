@@ -4,20 +4,14 @@ AnyRouter 余额查询服务
 """
 
 import asyncio
-import base64
 import contextlib
+from datetime import datetime
 import hmac
 import json
 import os
-import random
 import re
-import smtplib
-import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
-from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
