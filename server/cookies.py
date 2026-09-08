@@ -33,6 +33,13 @@ ANYROUTER_CONFIG = {
 	'waf_cookie_names': ['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
 }
 
+# 签到完成后顺带自动续期：剩余天数 ≤ 此值（或本地解码失败）的 cookie 账号
+# 打一次 /api/oauth/state 换新 session（+30 天）。new-api 服务端只在这类请求里
+# 重发 session cookie，签到接口不会 —— 不续的话 30 天一到账号就掉出自动签到。
+# 阈值内平均每账号 ~23 天才触发一次，一个请求对 ESA 限流窗口毫无压力。
+RENEW_BEFORE_DAYS = 7
+
+
 
 class AccountItem(BaseModel):
 	"""传统 session cookie 方式"""
@@ -511,8 +518,71 @@ def load_anyrouter_checkin_state():
 	bs._checkin_load(bs.anyrouter_checkin_state, bs.ANYROUTER_CHECKIN_STATE_FILE, 'ANYROUTER')
 
 
+async def _auto_renew_stale_cookies(accounts: list, checkin_results: list, waf_cookies: dict):
+	"""签到后顺带续期临期 cookie：并发打 oauth/state 换新 session 并写回 saved_config.json。
+
+	只处理剩余天数 ≤ RENEW_BEFORE_DAYS 或本地解码失败的账号；续期结果逐账号记入签到日志。
+	与 anyrouter_renew 端点同规则：任一账号撞上 ESA IP 限流立即中止剩余账号（限的是出口 IP，
+	其余账号必然同样失败，白打请求还可能把封禁窗口续上）。
+	"""
+	import balance_server as bs
+
+	# 签到期间已撞限流的，本轮不再发任何上游请求，彻底停手等窗口过去
+	if any(r and r.get('blocked') == 'ratelimit' for r in checkin_results):
+		add_anyrouter_checkin_log('自动续期跳过：签到期间撞上站点限流，本轮不续期')
+		return
+
+	stale = []
+	for a in accounts:
+		info = bs._session_expiry_info(a.cookies.get('session', '')) or {}
+		days = info.get('days_left')
+		# 解码失败（days 为 None）也续：renew_one_cookie 会打接口核实身份，失效自会报错
+		if days is None or days <= RENEW_BEFORE_DAYS:
+			stale.append(a)
+	if not stale:
+		add_anyrouter_checkin_log(f'自动续期跳过：全部 cookie 有效期充足（剩余 > {RENEW_BEFORE_DAYS} 天）')
+		return
+
+	add_anyrouter_checkin_log(
+		f'自动续期 {len(stale)} 个临期账号：' + '、'.join(a.name for a in stale)
+	)
+	sem = asyncio.Semaphore(bs.ANYROUTER_CONCURRENCY)
+	ratelimited = asyncio.Event()
+
+	def _skipped(name: str) -> dict:
+		return {'name': name, 'success': False, 'message': '已跳过：站点正在限流，本轮提前中止', 'skipped': True}
+
+	async def _limited(a):
+		if ratelimited.is_set():
+			return _skipped(a.name)
+		async with sem:
+			if ratelimited.is_set():
+				return _skipped(a.name)
+			r = await bs.renew_one_cookie(a, waf_cookies)
+		if r.get('blocked') == 'ratelimit':
+			ratelimited.set()
+		return r
+
+	results = await asyncio.gather(*[_limited(a) for a in stale])
+	# 写回续期成功的新 session（同 anyrouter_renew 端点）
+	updates = {r['name']: r['new_session'] for r in results if r.get('success') and r.get('new_session')}
+	save_renewed_sessions(updates)
+	renewed = sum(1 for r in results if r.get('success'))
+	skipped = sum(1 for r in results if r.get('skipped'))
+	failed = len(results) - renewed - skipped
+	for r in results:
+		if r.get('success'):
+			add_anyrouter_checkin_log(f'{r["name"]}: 自动续期成功（有效期至 {r.get("expires_at", "?")}）')
+		elif not r.get('skipped'):
+			add_anyrouter_checkin_log(f'{r["name"]}: 自动续期失败 · {r.get("message", "")}')
+	add_anyrouter_checkin_log(f'自动续期结束：成功 {renewed} · 失败 {failed}' + (f' · 跳过 {skipped}（限流中止）' if skipped else ''))
+
+
 async def run_anyrouter_checkin(trigger: str = 'manual'):
-	"""执行签到：cookie 账号并发签到（Semaphore 取 ANYROUTER_CONCURRENCY），数秒内完成。"""
+	"""执行签到：cookie 账号并发签到（Semaphore 取 ANYROUTER_CONCURRENCY），数秒内完成。
+
+	签到完成后顺带自动续期临期 cookie（≤ RENEW_BEFORE_DAYS 天），省去 30 天一次的手动续期。
+	"""
 	import balance_server as bs
 
 	accounts = load_cookie_accounts()
@@ -562,7 +632,7 @@ async def run_anyrouter_checkin(trigger: str = 'manual'):
 	async def _one(acc: AccountItem):
 		async with sem:
 			if not st['running']:
-				return
+				return None
 			result = await bs.sign_in(acc, waf_cookies)
 			ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 			if result.get('success'):
@@ -572,8 +642,11 @@ async def run_anyrouter_checkin(trigger: str = 'manual'):
 				st['accounts'][acc.name] = {'status': 'failed', 'message': result.get('message', '签到失败'), 'time': ts}
 			add_anyrouter_checkin_log(f'{acc.name}: {st["accounts"][acc.name]["message"]}')
 			save_anyrouter_checkin_state()
+			return result
 
-	await asyncio.gather(*[_one(a) for a in accounts])
+	results = await asyncio.gather(*[_one(a) for a in accounts])
+	# 签到完成，顺带续期临期 cookie（限流中自动整轮跳过）
+	await _auto_renew_stale_cookies(accounts, results, waf_cookies)
 	_finish()
 
 
