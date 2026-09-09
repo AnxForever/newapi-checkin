@@ -79,7 +79,7 @@ export function SitesPage() {
     }
     setAdding(true);
     try {
-      const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim().replace(/^https?:\/\//, "") };
+      const input = { id: newId.trim(), label: newLabel.trim(), domain: newDomain.trim() };
       await apiPost<SitesResponse>("/sites", { sites: [...sites, input] });
       await queryClient.invalidateQueries({ queryKey: ["accounts", "sites"] });
       toast.success(`已接入 ${input.label}，去「账号管理」添加它的账号`);
@@ -134,7 +134,7 @@ export function SitesPage() {
           </div>
           <div className="space-y-1">
             <Label htmlFor="site-domain" className="text-xs">域名</Label>
-            <Input id="site-domain" value={newDomain} onChange={(e) => setNewDomain(e.target.value)} className="h-8 font-data text-xs" placeholder="https://gorouter.app" />
+            <Input id="site-domain" value={newDomain} onChange={(e) => setNewDomain(e.target.value)} className="h-8 font-data text-xs" placeholder="kktoken.cc 或 https://gorouter.app" />
           </div>
           <div className="flex items-end gap-2">
             <Button type="button" variant="secondary" onClick={() => void onProbe()} disabled={probing}>

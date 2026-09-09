@@ -3049,7 +3049,7 @@ async def save_sites(req: dict):
 			if not s.id.replace('_', '').replace('-', '').isalnum():
 				return {'success': False, 'error': f'站点 id 只能用字母数字与 -_：{s.id}'}
 			if not s.domain.startswith('http'):
-				return {'success': False, 'error': f'域名要带 http(s)://：{s.domain}'}
+				s.domain = f'https://{s.domain}'
 			s.domain = s.domain.rstrip('/')
 		save_newapi_sites(validated)
 		return {'success': True, 'sites': [s.model_dump() for s in validated]}
@@ -3066,7 +3066,7 @@ async def probe_site(req: dict):
 	"""
 	domain = (req.get('domain') or '').strip().rstrip('/')
 	if not domain.startswith('http'):
-		return {'success': False, 'error': '域名要带 http(s)://'}
+		domain = f'https://{domain}'
 	probe = NewapiSite(id='__probe__', label='probe', domain=domain)
 	try:
 		resp = await newapi_request(probe, 'GET', probe.status_path, {'User-Agent': USER_AGENT})
