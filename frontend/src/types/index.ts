@@ -77,6 +77,8 @@ export interface NewapiSite {
   quota_per_unit: number;
   concurrency: number;
   auto_checkin: boolean;
+  /** false = 直连；站点在 Cloudflare 后直连 403 时应保持 true（走 HTTPS_PROXY 指定的本地代理） */
+  use_proxy: boolean;
   accounts_file: string;
   state_file: string;
 }
