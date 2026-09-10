@@ -364,6 +364,7 @@ class NewapiSite(BaseModel):
 	quota_per_unit: int = NEWAPI_DEFAULTS['quota_per_unit']
 	concurrency: int = NEWAPI_CONCURRENCY
 	auto_checkin: bool = True
+	use_proxy: bool = True  # False = 直连；站点在 Cloudflare 后直连 403 时应保持 True
 	accounts_file: str = ''
 	state_file: str = ''
 
@@ -1082,15 +1083,19 @@ def _newapi_headers(site: NewapiSite, account: NewapiAccountItem) -> dict:
 
 
 async def newapi_request(site: NewapiSite, method: str, path: str, headers: dict, json_body=None):
-	"""向 new-api 站点发请求。这类站点在 Cloudflare 后，实测无需代理/WAF cookie，仍带 Chrome 指纹更稳。
+	"""向 new-api 站点发请求。站点 use_proxy=True 时走本地代理出口（_PROXY，可用 HTTPS_PROXY 覆盖），
+	直连被 Cloudflare 拦 403 的站点保持走代理；use_proxy=False 则直连。仍带 Chrome 指纹更稳。
 
 	Session 按站点分开复用（key 用 site.id），避免不同域名共用连接池。
 	"""
 	url = site.domain + path
+	proxies = {'https': _PROXY, 'http': _PROXY} if site.use_proxy else None
+	# 缓存键带上代理模式：Session 创建时固定了 proxies，切换开关后必须换新 Session 才能生效
+	sess_key = f'newapi:{site.id}:{"proxy" if site.use_proxy else "direct"}'
 
 	def _do():
-		sess = _get_cffi_session(f'newapi:{site.id}')
-		return sess.request(method.upper(), url, headers=headers, json=json_body)
+		sess = _get_cffi_session(sess_key, proxies)
+		return sess.request(method.upper(), url, headers=headers, json=json_body, proxies=proxies)
 
 	loop = asyncio.get_running_loop()
 	return await loop.run_in_executor(_UPSTREAM_POOL, _do)
@@ -3044,7 +3049,7 @@ async def save_sites(req: dict):
 			if not s.id.replace('_', '').replace('-', '').isalnum():
 				return {'success': False, 'error': f'站点 id 只能用字母数字与 -_：{s.id}'}
 			if not s.domain.startswith('http'):
-				return {'success': False, 'error': f'域名要带 http(s)://：{s.domain}'}
+				s.domain = f'https://{s.domain}'
 			s.domain = s.domain.rstrip('/')
 		save_newapi_sites(validated)
 		return {'success': True, 'sites': [s.model_dump() for s in validated]}
@@ -3061,7 +3066,7 @@ async def probe_site(req: dict):
 	"""
 	domain = (req.get('domain') or '').strip().rstrip('/')
 	if not domain.startswith('http'):
-		return {'success': False, 'error': '域名要带 http(s)://'}
+		domain = f'https://{domain}'
 	probe = NewapiSite(id='__probe__', label='probe', domain=domain)
 	try:
 		resp = await newapi_request(probe, 'GET', probe.status_path, {'User-Agent': USER_AGENT})
